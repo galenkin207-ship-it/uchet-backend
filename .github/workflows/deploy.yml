@@ -1,0 +1,64 @@
+name: Deploy uchet-backend
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. Бэкап текущей версии на сервере (чтобы было куда откатиться)
+      - name: Backup current version on server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            TS=$(date +%Y%m%d_%H%M%S)
+            mkdir -p /opt/uchet_backups/backend
+            cp -a /opt/uchet/server /opt/uchet_backups/backend/$TS
+            echo "$TS" > /opt/uchet_backups/backend/LAST_BACKUP
+            # храним последние 14 бэкапов
+            cd /opt/uchet_backups/backend && ls -1t -d */ 2>/dev/null | tail -n +15 | xargs -r rm -rf
+
+      # 2. Синхронизация файлов (без .env, node_modules — они остаются на сервере/ставятся заново)
+      - name: Sync files via rsync
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -avzr --delete --exclude=".git/" --exclude=".github/" --exclude="node_modules/" --exclude=".env"
+          path: ./
+          remote_path: /opt/uchet/server/
+          remote_host: ${{ secrets.SSH_HOST }}
+          remote_user: ${{ secrets.SSH_USER }}
+          remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      # 3. Установка зависимостей, рестарт, health-check; при сбое — откат
+      - name: Install, restart, health-check and auto-rollback
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            rollback() {
+              echo "!!! ОШИБКА — откатываюсь на предыдущую версию !!!"
+              LAST=$(cat /opt/uchet_backups/backend/LAST_BACKUP)
+              rm -rf /opt/uchet/server
+              cp -a /opt/uchet_backups/backend/$LAST /opt/uchet/server
+              sudo systemctl restart uchet-backend
+              exit 1
+            }
+
+            cd /opt/uchet/server || rollback
+            npm install --omit=dev || rollback
+            node --check src/index.js || rollback
+            sudo systemctl restart uchet-backend || rollback
+            sudo systemctl is-active uchet-backend || rollback
+            sleep 1
+            curl -sf http://127.0.0.1:3001/api/health || rollback
+            echo "Деплой backend успешен."
