@@ -24,7 +24,7 @@ app.use(express.json({ limit: "2mb" }));
 app.use(cookieParser());
 app.use(attachUser);
 
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
+app.get("/api/health", (_req, res) => res.json({ ok: true, version: "1.0.1" }));
 
 app.use("/api", authRouter);
 app.use("/api/objects", objectsRouter);
