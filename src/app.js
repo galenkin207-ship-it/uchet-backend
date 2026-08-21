@@ -9,6 +9,7 @@ import { objectsRouter, employeesRouter, unitsRouter, workTypesRouter } from "./
 import { recordsRouter } from "./routes/records.js";
 import { requestsRouter } from "./routes/requests.js";
 import { usersRouter } from "./routes/users.js";
+import { pinnedObjectsRouter } from "./routes/pinned-objects.js";
 
 export const app = express();
 
@@ -34,6 +35,7 @@ app.use("/api/work-types", workTypesRouter);
 app.use("/api/records", recordsRouter);
 app.use("/api/requests", requestsRouter);
 app.use("/api/users", usersRouter);
+app.use("/api/pinned-objects", pinnedObjectsRouter);
 
 app.use((err, _req, res, _next) => {
   console.error(err);
