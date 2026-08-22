@@ -108,7 +108,10 @@ function computeItemsAndTotal(items) {
 
 recordsRouter.post("/", requireAuth, async (req, res) => {
   const { object_id, object_name, employees = [], date, items, comment = "", status = "done" } = req.body || {};
-  if (!object_name || !date) return res.status(400).json({ error: "object and date are required" });
+  if (!date) return res.status(400).json({ error: "date is required" });
+  if (status === "done" && !object_name) {
+    return res.status(400).json({ error: "object is required to complete a record" });
+  }
   const { normalized, total } = computeItemsAndTotal(items);
   if (status === "done" && !normalized.length) return res.status(400).json({ error: "no valid items" });
 
@@ -118,7 +121,7 @@ recordsRouter.post("/", requireAuth, async (req, res) => {
     const { rows } = await client.query(
       `INSERT INTO records (object_id, object_name_raw, employees, claimed_by, created_by_user_id, date, total, comment, status)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-      [object_id || null, object_name, employees, req.user.full_name, req.user.id, date, total, comment, status],
+      [object_id || null, object_name || "", employees, req.user.full_name, req.user.id, date, total, comment, status],
     );
     const recordId = rows[0].id;
 
@@ -168,7 +171,7 @@ recordsRouter.put("/:id", requireAuth, async (req, res) => {
       `UPDATE records SET object_id=$1, object_name_raw=$2, employees=$3, date=$4, total=$5,
          comment=$6, status=COALESCE($7, status), modified_by=$8, modified_by_user_id=$9, modified_at=now()
        WHERE id=$10`,
-      [object_id || null, object_name, employees, date, total, comment, status, req.user.full_name, req.user.id, req.params.id],
+      [object_id || null, object_name || "", employees, date, total, comment, status, req.user.full_name, req.user.id, req.params.id],
     );
     await client.query(`DELETE FROM record_items WHERE record_id = $1`, [req.params.id]);
     for (let i = 0; i < normalized.length; i++) {
