@@ -5,8 +5,38 @@ import { requireAuth, requireRole } from "../auth.js";
 export const requestsRouter = Router();
 
 requestsRouter.get("/", requireAuth, async (_req, res) => {
-  const { rows } = await pool.query(`SELECT * FROM requests ORDER BY id DESC`);
+  const { rows } = await pool.query(`
+    SELECT r.*,
+      COALESCE(
+        json_agg(
+          json_build_object('id', c.id, 'author', c.author, 'text', c.text, 'created_at', c.created_at)
+          ORDER BY c.created_at
+        ) FILTER (WHERE c.id IS NOT NULL),
+        '[]'
+      ) AS comments
+    FROM requests r
+    LEFT JOIN request_comments c ON c.request_id = r.id
+    GROUP BY r.id
+    ORDER BY r.id DESC
+  `);
   res.json(rows);
+});
+
+requestsRouter.post("/:id/comments", requireAuth, async (req, res) => {
+  const { text } = req.body || {};
+  if (!text || !String(text).trim()) return res.status(400).json({ error: "text is required" });
+
+  const { rows: reqRows } = await pool.query(`SELECT id FROM requests WHERE id = $1`, [
+    req.params.id,
+  ]);
+  if (!reqRows[0]) return res.status(404).json({ error: "request not found" });
+
+  const { rows } = await pool.query(
+    `INSERT INTO request_comments (request_id, author, author_user_id, text)
+     VALUES ($1,$2,$3,$4) RETURNING id, author, text, created_at`,
+    [req.params.id, req.user.full_name, req.user.id, String(text).trim()],
+  );
+  res.status(201).json(rows[0]);
 });
 
 requestsRouter.post("/", requireAuth, async (req, res) => {
