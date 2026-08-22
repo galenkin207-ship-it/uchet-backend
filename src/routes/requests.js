@@ -1,8 +1,19 @@
 import { Router } from "express";
 import { pool } from "../db.js";
 import { requireAuth, requireRole } from "../auth.js";
+import { sendPushToRole, sendPushToUser } from "../push-notify.js";
 
 export const requestsRouter = Router();
+
+// Ищем id пользователя по ФИО (requests.submitted_by хранит имя, а не id) —
+// нужен только для адресной push-рассылки, на основную логику не влияет.
+async function findUserIdByName(fullName) {
+  if (!fullName) return null;
+  const { rows } = await pool.query(`SELECT id FROM users WHERE full_name = $1 LIMIT 1`, [
+    fullName,
+  ]);
+  return rows[0]?.id ?? null;
+}
 
 requestsRouter.get("/", requireAuth, async (_req, res) => {
   const { rows } = await pool.query(`
@@ -37,6 +48,26 @@ requestsRouter.post("/:id/comments", requireAuth, async (req, res) => {
     [req.params.id, req.user.full_name, req.user.id, String(text).trim()],
   );
   res.status(201).json(rows[0]);
+
+  // Уведомляем "другую сторону" переписки — не самого отправителя.
+  const { rows: reqInfo } = await pool.query(
+    `SELECT submitted_by, text FROM requests WHERE id = $1`,
+    [req.params.id],
+  );
+  const parent = reqInfo[0];
+  if (parent) {
+    const payload = {
+      title: `${req.user.full_name}: новое сообщение`,
+      body: String(text).trim(),
+      url: `/messages?request=${req.params.id}`,
+    };
+    if (req.user.full_name === parent.submitted_by) {
+      void sendPushToRole("admin", payload, req.user.id);
+    } else {
+      const authorId = await findUserIdByName(parent.submitted_by);
+      if (authorId) void sendPushToUser(authorId, payload);
+    }
+  }
 });
 
 // Автор может удалить свою заявку — это "мягкое" удаление: запись остаётся в
@@ -62,11 +93,29 @@ requestsRouter.delete("/:id", requireAuth, async (req, res) => {
       `UPDATE requests SET status = 'deleted' WHERE id = $1 RETURNING *`,
       [req.params.id],
     );
-    return res.json(rows[0]);
+    res.json(rows[0]);
+    void sendPushToRole(
+      "admin",
+      {
+        title: "Заявка удалена автором",
+        body: existing.text,
+        url: `/messages?request=${req.params.id}`,
+      },
+      req.user.id,
+    );
+    return;
   }
 
   await pool.query(`DELETE FROM requests WHERE id = $1`, [req.params.id]);
   res.json({ id: existing.id, deleted: true });
+  const authorId = await findUserIdByName(existing.submitted_by);
+  if (authorId) {
+    void sendPushToUser(authorId, {
+      title: "Ваша заявка удалена администратором",
+      body: existing.text,
+      url: "/messages",
+    });
+  }
 });
 
 requestsRouter.post("/", requireAuth, async (req, res) => {
@@ -77,6 +126,16 @@ requestsRouter.post("/", requireAuth, async (req, res) => {
     [text, req.user.full_name],
   );
   res.status(201).json(rows[0]);
+
+  void sendPushToRole(
+    "admin",
+    {
+      title: `${req.user.full_name}: новая заявка`,
+      body: text,
+      url: `/messages?request=${rows[0].id}`,
+    },
+    req.user.id,
+  );
 });
 
 // Одобрение/отклонение — только curator/admin.
@@ -105,4 +164,13 @@ requestsRouter.put("/:id", requireRole("curator", "admin"), async (req, res) => 
   }
 
   res.json(rows[0]);
+
+  const authorId = await findUserIdByName(rows[0].submitted_by);
+  if (authorId && (status === "approved" || status === "rejected")) {
+    void sendPushToUser(authorId, {
+      title: status === "approved" ? "Заявка одобрена" : "Заявка отклонена",
+      body: rows[0].text,
+      url: `/messages?request=${rows[0].id}`,
+    });
+  }
 });

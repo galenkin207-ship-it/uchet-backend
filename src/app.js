@@ -10,6 +10,7 @@ import { recordsRouter } from "./routes/records.js";
 import { requestsRouter } from "./routes/requests.js";
 import { usersRouter } from "./routes/users.js";
 import { pinnedObjectsRouter } from "./routes/pinned-objects.js";
+import { pushRouter } from "./routes/push.js";
 
 export const app = express();
 
@@ -36,6 +37,7 @@ app.use("/api/records", recordsRouter);
 app.use("/api/requests", requestsRouter);
 app.use("/api/users", usersRouter);
 app.use("/api/pinned-objects", pinnedObjectsRouter);
+app.use("/api/push", pushRouter);
 
 app.use((err, _req, res, _next) => {
   console.error(err);
