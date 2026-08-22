@@ -75,7 +75,15 @@ async function sendToSubscription(row, payload) {
     keys: { p256dh: row.p256dh, auth: row.auth },
   };
   try {
-    await webpush.sendNotification(subscription, JSON.stringify(payload));
+    await webpush.sendNotification(subscription, JSON.stringify(payload), {
+      // "high" — просим push-службу (Apple/Google/Mozilla) доставить как можно
+      // быстрее, а не откладывать ради экономии батареи получателя (это и было
+      // причиной задержки на телефоне — по умолчанию urgency не указывался).
+      urgency: "high",
+      // Если устройство совсем офлайн дольше минуты — смысла ждать дольше нет,
+      // всё равно эти события уже видны в самом приложении при следующем заходе.
+      TTL: 60,
+    });
   } catch (err) {
     // 404/410 — подписка больше не действительна (пользователь отписался/сменил браузер) — чистим её.
     if (err.statusCode === 404 || err.statusCode === 410) {
