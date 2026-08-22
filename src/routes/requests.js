@@ -39,6 +39,26 @@ requestsRouter.post("/:id/comments", requireAuth, async (req, res) => {
   res.status(201).json(rows[0]);
 });
 
+// Мягкое удаление своей заявки автором (или admin) — запись остаётся в базе
+// со статусом 'deleted', чтобы у остальных участников сохранялась карточка
+// и было видно, что заявку удалил её автор.
+requestsRouter.delete("/:id", requireAuth, async (req, res) => {
+  const { rows: existingRows } = await pool.query(`SELECT * FROM requests WHERE id = $1`, [
+    req.params.id,
+  ]);
+  const existing = existingRows[0];
+  if (!existing) return res.status(404).json({ error: "not found" });
+  if (existing.submitted_by !== req.user.full_name && req.user.role !== "admin") {
+    return res.status(403).json({ error: "not allowed" });
+  }
+
+  const { rows } = await pool.query(
+    `UPDATE requests SET status = 'deleted' WHERE id = $1 RETURNING *`,
+    [req.params.id],
+  );
+  res.json(rows[0]);
+});
+
 requestsRouter.post("/", requireAuth, async (req, res) => {
   const { text } = req.body || {};
   if (!text) return res.status(400).json({ error: "text is required" });
