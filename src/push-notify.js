@@ -1,5 +1,6 @@
 import webpush from "web-push";
 import { pool } from "./db.js";
+import { computeUnreadCount } from "./notification-count.js";
 
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
@@ -27,11 +28,19 @@ export function getVapidPublicKey() {
 export async function sendPushToUser(userId, payload) {
   if (!enabled) return;
   try {
+    const { rows: userRows } = await pool.query(
+      `SELECT id, full_name, role FROM users WHERE id = $1`,
+      [userId],
+    );
+    const user = userRows[0];
+    if (!user) return;
+
+    const badgeCount = await computeUnreadCount(user).catch(() => undefined);
     const { rows } = await pool.query(
       `SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = $1`,
       [userId],
     );
-    await Promise.all(rows.map((row) => sendToSubscription(row, payload)));
+    await Promise.all(rows.map((row) => sendToSubscription(row, { ...payload, badgeCount })));
   } catch (err) {
     console.error("sendPushToUser error:", err);
   }
@@ -41,14 +50,20 @@ export async function sendPushToUser(userId, payload) {
 export async function sendPushToRole(role, payload, excludeUserId) {
   if (!enabled) return;
   try {
-    const { rows } = await pool.query(
-      `SELECT ps.id, ps.endpoint, ps.p256dh, ps.auth
-       FROM push_subscriptions ps
-       JOIN users u ON u.id = ps.user_id
-       WHERE u.role = $1 AND ($2::int IS NULL OR u.id <> $2)`,
+    const { rows: targetUsers } = await pool.query(
+      `SELECT id, full_name, role FROM users WHERE role = $1 AND ($2::int IS NULL OR id <> $2)`,
       [role, excludeUserId ?? null],
     );
-    await Promise.all(rows.map((row) => sendToSubscription(row, payload)));
+    await Promise.all(
+      targetUsers.map(async (user) => {
+        const badgeCount = await computeUnreadCount(user).catch(() => undefined);
+        const { rows } = await pool.query(
+          `SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = $1`,
+          [user.id],
+        );
+        await Promise.all(rows.map((row) => sendToSubscription(row, { ...payload, badgeCount })));
+      }),
+    );
   } catch (err) {
     console.error("sendPushToRole error:", err);
   }
