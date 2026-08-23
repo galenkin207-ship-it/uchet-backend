@@ -6,12 +6,15 @@ import { requireAuth, requireRole } from "../auth.js";
 // { id, name, ... } — objects, employees, units, work_types.
 // Изменять (создавать/править/удалять) могут только curator/admin,
 // читать — любой авторизованный пользователь.
-function makeDirectoryRouter({ table, columns, orderBy = "id" }) {
+function makeDirectoryRouter({ table, columns, orderBy = "id", extraSelect = [] }) {
   const router = Router();
   const cols = columns.join(", ");
+  // extraSelect — колонки, которые нужно только читать (например, служебный
+  // статус), но не передавать в INSERT/UPDATE через общий механизм ниже.
+  const selectCols = [...columns, ...extraSelect].join(", ");
 
   router.get("/", requireAuth, async (_req, res) => {
-    const { rows } = await pool.query(`SELECT id, ${cols} FROM ${table} ORDER BY ${orderBy}`);
+    const { rows } = await pool.query(`SELECT id, ${selectCols} FROM ${table} ORDER BY ${orderBy}`);
     res.json(rows);
   });
 
@@ -47,6 +50,32 @@ function makeDirectoryRouter({ table, columns, orderBy = "id" }) {
 export const objectsRouter = makeDirectoryRouter({
   table: "objects",
   columns: ["name", "address", "progress_percent"],
+  extraSelect: ["status", "archived_at"],
+});
+
+// Завершение объекта: данные (записи, заявки, комментарии) никуда не деваются,
+// объект просто перестаёт показываться в основном списке и переходит в Историю.
+objectsRouter.patch("/:id/archive", requireRole("curator", "admin"), async (req, res) => {
+  const { rows } = await pool.query(
+    `UPDATE objects SET status = 'archived', archived_at = now()
+     WHERE id = $1
+     RETURNING id, name, address, progress_percent, status, archived_at`,
+    [req.params.id],
+  );
+  if (!rows[0]) return res.status(404).json({ error: "not found" });
+  res.json(rows[0]);
+});
+
+// Возврат объекта из Истории обратно в активную работу.
+objectsRouter.patch("/:id/restore", requireRole("curator", "admin"), async (req, res) => {
+  const { rows } = await pool.query(
+    `UPDATE objects SET status = 'active', archived_at = NULL
+     WHERE id = $1
+     RETURNING id, name, address, progress_percent, status, archived_at`,
+    [req.params.id],
+  );
+  if (!rows[0]) return res.status(404).json({ error: "not found" });
+  res.json(rows[0]);
 });
 
 export const employeesRouter = makeDirectoryRouter({
