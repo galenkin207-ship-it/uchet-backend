@@ -55,6 +55,8 @@ jobs:
             }
 
             cd /opt/uchet/server || rollback
+            echo "Проверяю, что все SQL-миграции применены на проде..."
+            node scripts/check-migrations.js || rollback
             npm install --omit=dev || rollback
             node --check src/index.js || rollback
             sudo systemctl restart uchet-backend || rollback
