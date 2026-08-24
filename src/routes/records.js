@@ -263,7 +263,14 @@ recordsRouter.delete("/:id", requireAuth, async (req, res) => {
 
   await pool.query(`DELETE FROM records WHERE id = $1`, [req.params.id]);
   // Фото не стираем сразу, а уносим в корзину — так их можно вернуть при восстановлении.
-  const trashName = movePhotosToTrash(req.params.id);
+  let trashName = null;
+  try {
+    trashName = movePhotosToTrash(req.params.id);
+  } catch (err) {
+    // Права/диск подвели — запись всё равно уже удалена из БД, не роняем
+    // процесс из-за отдельно взятой файловой операции с фото.
+    console.error(`Не удалось перенести фото записи ${req.params.id} в корзину:`, err);
+  }
 
   await insertAuditLog(pool, {
     entityType: "record",
@@ -292,7 +299,15 @@ recordsRouter.post("/:id/photos", requireAuth, upload.array("photos", PHOTO_MAX_
   }
 
   const dir = path.join(PHOTOS_DIR, String(req.params.id));
-  fs.mkdirSync(dir, { recursive: true });
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    // Не даём одной ошибке прав/диска положить весь процесс для всех
+    // пользователей — раньше необработанное исключение здесь роняло
+    // uchet-backend.service целиком (см. systemd restart counter).
+    console.error(`Не удалось создать папку под фото записи ${req.params.id}:`, err);
+    return res.status(500).json({ error: "failed to create photos directory" });
+  }
 
   const saved = [];
   for (const file of files) {
@@ -307,7 +322,12 @@ recordsRouter.post("/:id/photos", requireAuth, upload.array("photos", PHOTO_MAX_
         .jpeg({ quality: 82 })
         .toFile(destPath);
     } catch {
-      fs.writeFileSync(destPath, file.buffer); // если sharp не смог разобрать формат — сохраняем как есть
+      try {
+        fs.writeFileSync(destPath, file.buffer); // если sharp не смог разобрать формат — сохраняем как есть
+      } catch (writeErr) {
+        console.error(`Не удалось сохранить фото ${fname} записи ${req.params.id}:`, writeErr);
+        continue; // пропускаем это фото, но не роняем весь запрос/процесс
+      }
     }
     saved.push(fname);
     await pool.query(
