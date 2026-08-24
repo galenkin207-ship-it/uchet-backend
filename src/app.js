@@ -12,6 +12,7 @@ import { usersRouter } from "./routes/users.js";
 import { pinnedObjectsRouter } from "./routes/pinned-objects.js";
 import { pushRouter } from "./routes/push.js";
 import { notificationReadsRouter } from "./routes/notification-reads.js";
+import { auditRouter } from "./routes/audit.js";
 
 export const app = express();
 
@@ -40,6 +41,7 @@ app.use("/api/users", usersRouter);
 app.use("/api/pinned-objects", pinnedObjectsRouter);
 app.use("/api/push", pushRouter);
 app.use("/api/notification-reads", notificationReadsRouter);
+app.use("/api/audit-log", auditRouter);
 
 app.use((err, _req, res, _next) => {
   console.error(err);

@@ -6,9 +6,46 @@ import multer from "multer";
 import sharp from "sharp";
 import { pool } from "../db.js";
 import { requireAuth } from "../auth.js";
+import { insertAuditLog } from "../audit.js";
 
 const PHOTOS_DIR = process.env.PHOTOS_DIR || "/opt/uchet/uploads/photos";
 fs.mkdirSync(PHOTOS_DIR, { recursive: true });
+
+// Корзина для фото удалённых записей: при удалении записи её папка с фото не
+// стирается сразу, а переносится сюда — это нужно, чтобы аудит-лог мог
+// восстановить фото вместе с записью. Живёт до тех пор, пока кто-то явно не
+// восстановит запись; чистка старой корзины — отдельная задача на будущее.
+const PHOTOS_TRASH_DIR = process.env.PHOTOS_TRASH_DIR || "/opt/uchet/uploads/photos-trash";
+fs.mkdirSync(PHOTOS_TRASH_DIR, { recursive: true });
+
+export function movePhotosToTrash(recordId) {
+  const srcDir = path.join(PHOTOS_DIR, String(recordId));
+  if (!fs.existsSync(srcDir)) return null;
+  const trashName = `${recordId}-${Date.now()}`;
+  const destDir = path.join(PHOTOS_TRASH_DIR, trashName);
+  try {
+    fs.renameSync(srcDir, destDir);
+  } catch {
+    // На случай, если PHOTOS_DIR и PHOTOS_TRASH_DIR на разных ФС (EXDEV) — копируем и чистим исходник.
+    fs.cpSync(srcDir, destDir, { recursive: true });
+    fs.rmSync(srcDir, { recursive: true, force: true });
+  }
+  return trashName;
+}
+
+export function restorePhotosFromTrash(recordId, trashName) {
+  if (!trashName) return false;
+  const srcDir = path.join(PHOTOS_TRASH_DIR, trashName);
+  if (!fs.existsSync(srcDir)) return false;
+  const destDir = path.join(PHOTOS_DIR, String(recordId));
+  try {
+    fs.renameSync(srcDir, destDir);
+  } catch {
+    fs.cpSync(srcDir, destDir, { recursive: true });
+    fs.rmSync(srcDir, { recursive: true, force: true });
+  }
+  return true;
+}
 
 const PHOTO_MAX_PER_RECORD = 12;
 const PHOTO_MAX_DIMENSION = 1920;
@@ -28,7 +65,7 @@ function canModify(record, user) {
   return record.created_by_user_id === user.id;
 }
 
-async function loadFullRecord(recordId) {
+export async function loadFullRecord(recordId) {
   const { rows: recRows } = await pool.query(`SELECT * FROM records WHERE id = $1`, [recordId]);
   const record = recRows[0];
   if (!record) return null;
@@ -143,6 +180,15 @@ recordsRouter.post("/", requireAuth, async (req, res) => {
 
     await client.query("COMMIT");
     const full = await loadFullRecord(recordId);
+    await insertAuditLog(pool, {
+      entityType: "record",
+      entityId: recordId,
+      action: "create",
+      actorUserId: req.user.id,
+      actorName: req.user.full_name,
+      before: null,
+      after: full,
+    });
     res.status(201).json(full);
   } catch (err) {
     await client.query("ROLLBACK");
@@ -191,6 +237,15 @@ recordsRouter.put("/:id", requireAuth, async (req, res) => {
     }
     await client.query("COMMIT");
     const full = await loadFullRecord(req.params.id);
+    await insertAuditLog(pool, {
+      entityType: "record",
+      entityId: Number(req.params.id),
+      action: "update",
+      actorUserId: req.user.id,
+      actorName: req.user.full_name,
+      before: existing,
+      after: full,
+    });
     res.json(full);
   } catch (err) {
     await client.query("ROLLBACK");
@@ -207,8 +262,19 @@ recordsRouter.delete("/:id", requireAuth, async (req, res) => {
   if (!canModify(existing, req.user)) return res.status(403).json({ error: "forbidden" });
 
   await pool.query(`DELETE FROM records WHERE id = $1`, [req.params.id]);
-  const dir = path.join(PHOTOS_DIR, String(req.params.id));
-  fs.rm(dir, { recursive: true, force: true }, () => {});
+  // Фото не стираем сразу, а уносим в корзину — так их можно вернуть при восстановлении.
+  const trashName = movePhotosToTrash(req.params.id);
+
+  await insertAuditLog(pool, {
+    entityType: "record",
+    entityId: Number(req.params.id),
+    action: "delete",
+    actorUserId: req.user.id,
+    actorName: req.user.full_name,
+    before: { ...existing, _photos_trash_dir: trashName },
+    after: null,
+  });
+
   res.json({ deleted: Number(req.params.id) });
 });
 

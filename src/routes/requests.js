@@ -2,6 +2,7 @@ import { Router } from "express";
 import { pool } from "../db.js";
 import { requireAuth, requireRole } from "../auth.js";
 import { sendPushToRole, sendPushToUser } from "../push-notify.js";
+import { insertAuditLog } from "../audit.js";
 
 export const requestsRouter = Router();
 
@@ -13,6 +14,29 @@ async function findUserIdByName(fullName) {
     fullName,
   ]);
   return rows[0]?.id ?? null;
+}
+
+// Полный снимок заявки вместе с перепиской — используется и для GET /:id-подобной
+// логики, и как снимок "до"/"после" для аудит-лога.
+export async function loadFullRequest(id) {
+  const { rows } = await pool.query(
+    `SELECT r.*,
+      COALESCE(
+        json_agg(
+          json_build_object(
+            'id', c.id, 'author', c.author, 'author_user_id', c.author_user_id,
+            'text', c.text, 'created_at', c.created_at
+          ) ORDER BY c.created_at
+        ) FILTER (WHERE c.id IS NOT NULL),
+        '[]'
+      ) AS comments
+    FROM requests r
+    LEFT JOIN request_comments c ON c.request_id = r.id
+    WHERE r.id = $1
+    GROUP BY r.id`,
+    [id],
+  );
+  return rows[0] || null;
 }
 
 requestsRouter.get("/", requireAuth, async (_req, res) => {
@@ -77,10 +101,7 @@ requestsRouter.post("/:id/comments", requireAuth, async (req, res) => {
 // удаление (запись и переписка по ней стираются насовсем), т.к. для чужой
 // заявки пометка "автор удалил" была бы неверной.
 requestsRouter.delete("/:id", requireAuth, async (req, res) => {
-  const { rows: existingRows } = await pool.query(`SELECT * FROM requests WHERE id = $1`, [
-    req.params.id,
-  ]);
-  const existing = existingRows[0];
+  const existing = await loadFullRequest(req.params.id);
   if (!existing) return res.status(404).json({ error: "not found" });
 
   const isOwn = existing.submitted_by === req.user.full_name;
@@ -93,6 +114,17 @@ requestsRouter.delete("/:id", requireAuth, async (req, res) => {
       `UPDATE requests SET status = 'deleted' WHERE id = $1 RETURNING *`,
       [req.params.id],
     );
+    // Мягкое удаление: строка остаётся в БД, поэтому при восстановлении
+    // достаточно откатить статус назад — исходная строка никуда не делась.
+    await insertAuditLog(pool, {
+      entityType: "request",
+      entityId: Number(req.params.id),
+      action: "delete",
+      actorUserId: req.user.id,
+      actorName: req.user.full_name,
+      before: { ...existing, _hard_deleted: false },
+      after: null,
+    });
     res.json(rows[0]);
     void sendPushToRole(
       "admin",
@@ -107,6 +139,17 @@ requestsRouter.delete("/:id", requireAuth, async (req, res) => {
   }
 
   await pool.query(`DELETE FROM requests WHERE id = $1`, [req.params.id]);
+  // Жёсткое удаление (admin): строка и переписка стёрты насовсем — снимок
+  // "до" уже включает комментарии, восстановление пересоберёт всё заново.
+  await insertAuditLog(pool, {
+    entityType: "request",
+    entityId: Number(req.params.id),
+    action: "delete",
+    actorUserId: req.user.id,
+    actorName: req.user.full_name,
+    before: { ...existing, _hard_deleted: true },
+    after: null,
+  });
   res.json({ id: existing.id, deleted: true });
   const authorId = await findUserIdByName(existing.submitted_by);
   if (authorId) {
@@ -125,6 +168,15 @@ requestsRouter.post("/", requireAuth, async (req, res) => {
     `INSERT INTO requests (text, submitted_by, status) VALUES ($1,$2,'pending') RETURNING *`,
     [text, req.user.full_name],
   );
+  await insertAuditLog(pool, {
+    entityType: "request",
+    entityId: rows[0].id,
+    action: "create",
+    actorUserId: req.user.id,
+    actorName: req.user.full_name,
+    before: null,
+    after: { ...rows[0], comments: [] },
+  });
   res.status(201).json(rows[0]);
 
   void sendPushToRole(
@@ -140,6 +192,9 @@ requestsRouter.post("/", requireAuth, async (req, res) => {
 
 // Одобрение/отклонение — только curator/admin.
 requestsRouter.put("/:id", requireRole("curator", "admin"), async (req, res) => {
+  const before = await loadFullRequest(req.params.id);
+  if (!before) return res.status(404).json({ error: "not found" });
+
   const { status, resolved_name, resolved_unit, resolved_price, reject_reason } = req.body || {};
   const { rows } = await pool.query(
     `UPDATE requests SET
@@ -162,6 +217,16 @@ requestsRouter.put("/:id", requireRole("curator", "admin"), async (req, res) => 
       [resolved_name, resolved_unit, resolved_price],
     );
   }
+
+  await insertAuditLog(pool, {
+    entityType: "request",
+    entityId: Number(req.params.id),
+    action: "update",
+    actorUserId: req.user.id,
+    actorName: req.user.full_name,
+    before,
+    after: { ...rows[0], comments: before.comments },
+  });
 
   res.json(rows[0]);
 
