@@ -6,7 +6,7 @@ import { requireAuth, requireRole } from "../auth.js";
 // { id, name, ... } — objects, employees, units, work_types.
 // Изменять (создавать/править/удалять) могут только curator/admin,
 // читать — любой авторизованный пользователь.
-function makeDirectoryRouter({ table, columns, orderBy = "id", extraSelect = [] }) {
+function makeDirectoryRouter({ table, columns, orderBy = "id", extraSelect = [], afterUpdate }) {
   const router = Router();
   const cols = columns.join(", ");
   // extraSelect — колонки, которые нужно только читать (например, служебный
@@ -31,12 +31,42 @@ function makeDirectoryRouter({ table, columns, orderBy = "id", extraSelect = [] 
   router.put("/:id", requireRole("curator", "admin"), async (req, res) => {
     const set = columns.map((c, i) => `${c} = $${i + 1}`).join(", ");
     const values = [...columns.map((c) => req.body[c]), req.params.id];
-    const { rows } = await pool.query(
-      `UPDATE ${table} SET ${set} WHERE id = $${columns.length + 1} RETURNING id, ${cols}`,
-      values,
-    );
-    if (!rows[0]) return res.status(404).json({ error: "not found" });
-    res.json(rows[0]);
+
+    // Простые справочники (объекты, сотрудники, единицы) без каскадных
+    // побочных эффектов обновляем как раньше, одним запросом без транзакции.
+    if (!afterUpdate) {
+      const { rows } = await pool.query(
+        `UPDATE ${table} SET ${set} WHERE id = $${columns.length + 1} RETURNING id, ${cols}`,
+        values,
+      );
+      if (!rows[0]) return res.status(404).json({ error: "not found" });
+      return res.json(rows[0]);
+    }
+
+    // Справочники, изменения в которых должны каскадно пересчитать уже
+    // существующие данные (например, виды работ → позиции записей →
+    // суммы записей) — всё в одной транзакции, чтобы не оставить БД в
+    // промежуточном состоянии при сбое на середине каскада.
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const { rows } = await client.query(
+        `UPDATE ${table} SET ${set} WHERE id = $${columns.length + 1} RETURNING id, ${cols}`,
+        values,
+      );
+      if (!rows[0]) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "not found" });
+      }
+      await afterUpdate(client, rows[0]);
+      await client.query("COMMIT");
+      res.json(rows[0]);
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
   });
 
   router.delete("/:id", requireRole("admin"), async (req, res) => {
@@ -91,4 +121,28 @@ export const unitsRouter = makeDirectoryRouter({
 export const workTypesRouter = makeDirectoryRouter({
   table: "work_types",
   columns: ["name", "unit", "price"],
+  afterUpdate: async (client, updated) => {
+    // Каскадный пересчёт: название/единица/цена вида работы всегда должны
+    // совпадать с тем, что показано во всех записях, где он использован —
+    // в т.ч. уже завершённых (done). Прежние значения нигде не сохраняются
+    // (по явному решению — история изменений цен не нужна).
+    await client.query(
+      `UPDATE record_items
+          SET name = $1, unit = $2, price = $3, sum = qty * $3
+        WHERE work_type_id = $4`,
+      [updated.name, updated.unit, updated.price, updated.id],
+    );
+    await client.query(
+      `UPDATE records r
+          SET total = sub.total
+         FROM (
+           SELECT record_id, COALESCE(SUM(sum), 0) AS total
+           FROM record_items
+           WHERE record_id IN (SELECT DISTINCT record_id FROM record_items WHERE work_type_id = $1)
+           GROUP BY record_id
+         ) sub
+        WHERE r.id = sub.record_id`,
+      [updated.id],
+    );
+  },
 });

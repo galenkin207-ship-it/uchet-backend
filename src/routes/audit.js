@@ -163,9 +163,9 @@ async function restoreRecord(id, snapshot) {
     for (let i = 0; i < (snapshot.items || []).length; i++) {
       const item = snapshot.items[i];
       const { rows: itemRows } = await client.query(
-        `INSERT INTO record_items (record_id, name, unit, qty, price, sum, manual, sort_order)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-        [id, item.name, item.unit, item.qty, item.price, item.sum, !!item.manual, i],
+        `INSERT INTO record_items (record_id, name, unit, qty, price, sum, manual, sort_order, work_type_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+        [id, item.name, item.unit, item.qty, item.price, item.sum, !!item.manual, i, item.work_type_id || null],
       );
       const itemId = itemRows[0].id;
       for (const share of item.shares || []) {
