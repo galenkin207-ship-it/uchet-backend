@@ -204,9 +204,19 @@ requestsRouter.put("/:id", requireRole("curator", "admin"), async (req, res) => 
        resolved_price = COALESCE($4, resolved_price),
        reject_reason = COALESCE($5, reject_reason),
        resolved_at = CASE WHEN $1 = 'approved' THEN now() ELSE resolved_at END,
-       rejected_at = CASE WHEN $1 = 'rejected' THEN now() ELSE rejected_at END
+       rejected_at = CASE WHEN $1 = 'rejected' THEN now() ELSE rejected_at END,
+       resolved_by = CASE WHEN $1 = 'approved' THEN $7 ELSE resolved_by END,
+       rejected_by = CASE WHEN $1 = 'rejected' THEN $7 ELSE rejected_by END
      WHERE id = $6 RETURNING *`,
-    [status, resolved_name, resolved_unit, resolved_price, reject_reason, req.params.id],
+    [
+      status,
+      resolved_name,
+      resolved_unit,
+      resolved_price,
+      reject_reason,
+      req.params.id,
+      req.user.full_name,
+    ],
   );
   if (!rows[0]) return res.status(404).json({ error: "not found" });
 
