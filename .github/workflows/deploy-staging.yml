@@ -1,0 +1,66 @@
+name: Deploy uchet-backend (staging)
+
+on:
+  push:
+    branches: [staging]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. Бэкап текущей staging-версии на сервере
+      - name: Backup current staging version on server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            TS=$(date +%Y%m%d_%H%M%S)
+            mkdir -p /opt/uchet_backups/backend-staging
+            cp -a /opt/uchet-staging/backend-src /opt/uchet_backups/backend-staging/$TS
+            echo "$TS" > /opt/uchet_backups/backend-staging/LAST_BACKUP
+            # храним последние 2 бэкапа на staging
+            cd /opt/uchet_backups/backend-staging && ls -1t -d */ 2>/dev/null | tail -n +3 | xargs -r rm -rf
+
+      # 2. Синхронизация файлов (без .env, node_modules — остаются на сервере/ставятся заново)
+      - name: Sync files via rsync
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -avzr --delete --exclude=".git/" --exclude=".github/" --exclude="node_modules/" --exclude=".env"
+          path: ./
+          remote_path: /opt/uchet-staging/backend-src/
+          remote_host: ${{ secrets.SSH_HOST }}
+          remote_user: ${{ secrets.SSH_USER }}
+          remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      # 3. Установка зависимостей, рестарт, health-check; при сбое — откат
+      - name: Install, restart, health-check and auto-rollback
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            rollback() {
+              echo "!!! ОШИБКА — откатываюсь на предыдущую версию (staging) !!!"
+              LAST=$(cat /opt/uchet_backups/backend-staging/LAST_BACKUP)
+              rm -rf /opt/uchet-staging/backend-src
+              cp -a /opt/uchet_backups/backend-staging/$LAST /opt/uchet-staging/backend-src
+              sudo systemctl restart uchet-backend-staging
+              exit 1
+            }
+
+            cd /opt/uchet-staging/backend-src || rollback
+            echo "Проверяю, что все SQL-миграции применены на staging..."
+            node scripts/check-migrations.js || rollback
+            npm_config_cache=/opt/npm-cache npm install --omit=dev || rollback
+            node --check src/index.js || rollback
+            sudo systemctl restart uchet-backend-staging || rollback
+            sudo systemctl is-active uchet-backend-staging || rollback
+            sleep 1
+            curl -sf http://127.0.0.1:4001/api/health || rollback
+            echo "Деплой backend (staging) успешен."
