@@ -14,6 +14,7 @@ import { hiddenObjectsRouter } from "./routes/hidden-objects.js";
 import { brigadesRouter } from "./routes/brigades.js";
 import { pushRouter } from "./routes/push.js";
 import { notificationReadsRouter } from "./routes/notification-reads.js";
+import { notificationHidesRouter } from "./routes/notification-hides.js";
 import { auditRouter } from "./routes/audit.js";
 
 export const app = express();
@@ -45,6 +46,7 @@ app.use("/api/hidden-objects", hiddenObjectsRouter);
 app.use("/api/brigades", brigadesRouter);
 app.use("/api/push", pushRouter);
 app.use("/api/notification-reads", notificationReadsRouter);
+app.use("/api/notification-hides", notificationHidesRouter);
 app.use("/api/audit-log", auditRouter);
 
 app.use((err, _req, res, _next) => {
