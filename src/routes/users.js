@@ -27,6 +27,17 @@ usersRouter.post("/", requireRole("admin"), async (req, res) => {
   if (!login || !password || !full_name) {
     return res.status(400).json({ error: "login, password and full_name are required" });
   }
+  // Проверка уникальности ФИО (без учёта регистра и лишних пробелов) — чтобы
+  // не завести одного и того же человека дважды под чуть разным написанием.
+  const { rows: dupRows } = await pool.query(
+    `SELECT id FROM users WHERE lower(btrim(full_name)) = lower(btrim($1))`,
+    [full_name],
+  );
+  if (dupRows.length) {
+    return res
+      .status(400)
+      .json({ error: `Пользователь «${String(full_name).trim()}» уже есть в списке` });
+  }
   const password_hash = await hashPassword(password);
   const { rows } = await pool.query(
     `INSERT INTO users (login, password_hash, full_name, role, active, is_submitter)
@@ -38,6 +49,17 @@ usersRouter.post("/", requireRole("admin"), async (req, res) => {
 
 usersRouter.put("/:id", requireRole("admin"), async (req, res) => {
   const { full_name, role, active, password, is_submitter } = req.body || {};
+  if (full_name && String(full_name).trim()) {
+    const { rows: dupRows } = await pool.query(
+      `SELECT id FROM users WHERE lower(btrim(full_name)) = lower(btrim($1)) AND id <> $2`,
+      [full_name, req.params.id],
+    );
+    if (dupRows.length) {
+      return res
+        .status(400)
+        .json({ error: `Пользователь «${String(full_name).trim()}» уже есть в списке` });
+    }
+  }
   const password_hash = password ? await hashPassword(password) : null;
   const { rows } = await pool.query(
     `UPDATE users SET

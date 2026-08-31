@@ -6,7 +6,14 @@ import { requireAuth, requireRole } from "../auth.js";
 // { id, name, ... } — objects, employees, units, work_types.
 // Изменять (создавать/править/удалять) могут только curator/admin,
 // читать — любой авторизованный пользователь.
-function makeDirectoryRouter({ table, columns, orderBy = "id", extraSelect = [], afterUpdate }) {
+function makeDirectoryRouter({
+  table,
+  columns,
+  orderBy = "id",
+  extraSelect = [],
+  afterUpdate,
+  validate,
+}) {
   const router = Router();
   const cols = columns.join(", ");
   // extraSelect — колонки, которые нужно только читать (например, служебный
@@ -19,6 +26,12 @@ function makeDirectoryRouter({ table, columns, orderBy = "id", extraSelect = [],
   });
 
   router.post("/", requireRole("curator", "admin"), async (req, res) => {
+    // validate — необязательная проверка перед записью (например, уникальность
+    // по имени без учёта регистра/пробелов). Возвращает текст ошибки или null.
+    if (validate) {
+      const error = await validate(pool, req.body, null);
+      if (error) return res.status(400).json({ error });
+    }
     const values = columns.map((c) => req.body[c]);
     const placeholders = columns.map((_, i) => `$${i + 1}`).join(", ");
     const { rows } = await pool.query(
@@ -29,6 +42,10 @@ function makeDirectoryRouter({ table, columns, orderBy = "id", extraSelect = [],
   });
 
   router.put("/:id", requireRole("curator", "admin"), async (req, res) => {
+    if (validate) {
+      const error = await validate(pool, req.body, req.params.id);
+      if (error) return res.status(400).json({ error });
+    }
     const set = columns.map((c, i) => `${c} = $${i + 1}`).join(", ");
     const values = [...columns.map((c) => req.body[c]), req.params.id];
 
@@ -112,10 +129,30 @@ objectsRouter.patch("/:id/restore", requireRole("curator", "admin"), async (req,
 // порядку добавления, как остальные справочники по умолчанию) — так проще
 // находить нужного человека в длинном списке, и новые сотрудники сразу
 // встают на своё место в списке, а не в конец.
+//
+// Проверка уникальности ФИО (без учёта регистра и лишних пробелов), чтобы
+// одного и того же сотрудника случайно не завели в справочник дважды под
+// чуть разным написанием пробелов/регистра.
+async function checkNameUnique(pool, table, name, excludeId, kindLabel) {
+  if (!name || !String(name).trim()) return null;
+  const { rows } = await pool.query(
+    excludeId
+      ? `SELECT id FROM ${table} WHERE lower(btrim(name)) = lower(btrim($1)) AND id <> $2`
+      : `SELECT id FROM ${table} WHERE lower(btrim(name)) = lower(btrim($1))`,
+    excludeId ? [name, excludeId] : [name],
+  );
+  if (rows.length) {
+    return `${kindLabel} «${String(name).trim()}» уже есть в справочнике`;
+  }
+  return null;
+}
+
 export const employeesRouter = makeDirectoryRouter({
   table: "employees",
   columns: ["name"],
   orderBy: "lower(name)",
+  validate: (pool, body, excludeId) =>
+    checkNameUnique(pool, "employees", body.name, excludeId, "Сотрудник"),
 });
 
 export const unitsRouter = makeDirectoryRouter({
