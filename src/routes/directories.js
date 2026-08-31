@@ -98,6 +98,10 @@ export const objectsRouter = makeDirectoryRouter({
   table: "objects",
   columns: ["name", "address", "progress_percent"],
   extraSelect: ["status", "archived_at"],
+  // Объекты — как и сотрудники — всегда по алфавиту, а не по порядку
+  // добавления: так новый объект сразу встаёт на своё место в списках и
+  // фильтрах, а не в конец.
+  orderBy: "lower(name)",
 });
 
 // Завершение объекта: данные (записи, заявки, комментарии) никуда не деваются,
