@@ -108,9 +108,14 @@ objectsRouter.patch("/:id/restore", requireRole("curator", "admin"), async (req,
   res.json(rows[0]);
 });
 
+// Сотрудники всегда показываются в алфавитном порядке по ФИО (а не по
+// порядку добавления, как остальные справочники по умолчанию) — так проще
+// находить нужного человека в длинном списке, и новые сотрудники сразу
+// встают на своё место в списке, а не в конец.
 export const employeesRouter = makeDirectoryRouter({
   table: "employees",
   columns: ["name"],
+  orderBy: "lower(name)",
 });
 
 export const unitsRouter = makeDirectoryRouter({
