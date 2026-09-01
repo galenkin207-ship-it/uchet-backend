@@ -65,6 +65,15 @@ function canModify(record, user) {
   return record.created_by_user_id === user.id;
 }
 
+// Пока запись в статусе "draft" (Незавершено), её видит только тот, кто её
+// начал ("Кто подал") — включая куратора/админа. После перехода в "done"
+// (Записано) запись становится видна всем.
+function canView(record, user) {
+  if (!user) return false;
+  if (record.status !== "draft") return true;
+  return record.created_by_user_id === user.id;
+}
+
 export async function loadFullRecord(recordId) {
   const { rows: recRows } = await pool.query(`SELECT * FROM records WHERE id = $1`, [recordId]);
   const record = recRows[0];
@@ -111,6 +120,11 @@ recordsRouter.get("/", requireAuth, async (req, res) => {
     clauses.push(`date <= $${params.length}`);
   }
 
+  // Черновики (status = 'draft') видны только их автору — остальным (в т.ч.
+  // куратору/админу) они не показываются, пока не проставлен статус "done".
+  params.push(req.user.id);
+  clauses.push(`(status <> 'draft' OR created_by_user_id = $${params.length})`);
+
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const { rows: countRows } = await pool.query(`SELECT COUNT(*) FROM records ${where}`, params);
   const total = Number(countRows[0].count);
@@ -130,6 +144,8 @@ recordsRouter.get("/", requireAuth, async (req, res) => {
 recordsRouter.get("/:id", requireAuth, async (req, res) => {
   const record = await loadFullRecord(req.params.id);
   if (!record) return res.status(404).json({ error: "not found" });
+  // Не раскрываем даже факт существования чужого черновика.
+  if (!canView(record, req.user)) return res.status(404).json({ error: "not found" });
   res.json(record);
 });
 
@@ -341,7 +357,10 @@ recordsRouter.post("/:id/photos", requireAuth, upload.array("photos", PHOTO_MAX_
   res.status(201).json({ photos: full.photos, added: saved });
 });
 
-recordsRouter.get("/:id/photos/:filename", requireAuth, (req, res) => {
+recordsRouter.get("/:id/photos/:filename", requireAuth, async (req, res) => {
+  const record = await loadFullRecord(req.params.id);
+  if (!record || !canView(record, req.user)) return res.status(404).json({ error: "not found" });
+
   const safeName = path.basename(req.params.filename);
   const filePath = path.join(PHOTOS_DIR, String(req.params.id), safeName);
   if (!filePath.startsWith(PHOTOS_DIR) || !fs.existsSync(filePath)) {
