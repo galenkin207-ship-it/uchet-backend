@@ -224,14 +224,18 @@ async function restoreRequest(id, snapshot) {
       );
     } else {
       // Заявка была удалена насовсем (admin) — восстанавливаем строку и переписку.
+      // snapshot.submitted_by_user_id может отсутствовать в очень старых снимках
+      // аудит-лога (сделанных до миграции 013) — тогда просто останется NULL,
+      // владение такой восстановленной заявкой определится по ФИО (см. requests.js).
       await client.query(
-        `INSERT INTO requests (id, text, submitted_by, status, resolved_name, resolved_unit,
+        `INSERT INTO requests (id, text, submitted_by, submitted_by_user_id, status, resolved_name, resolved_unit,
             resolved_price, reject_reason, created_at, resolved_at, rejected_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
         [
           id,
           snapshot.text,
           snapshot.submitted_by,
+          snapshot.submitted_by_user_id ?? null,
           snapshot.status,
           snapshot.resolved_name,
           snapshot.resolved_unit,
