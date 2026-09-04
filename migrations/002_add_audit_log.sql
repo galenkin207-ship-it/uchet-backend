@@ -22,3 +22,5 @@ CREATE INDEX IF NOT EXISTS audit_log_created_idx ON audit_log (created_at DESC);
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON audit_log TO uchet_app;
 GRANT USAGE, SELECT ON SEQUENCE audit_log_id_seq TO uchet_app;
+
+INSERT INTO schema_migrations (filename) VALUES ('002_add_audit_log.sql') ON CONFLICT DO NOTHING;

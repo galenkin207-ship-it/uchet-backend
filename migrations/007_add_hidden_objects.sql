@@ -14,4 +14,4 @@ CREATE TABLE IF NOT EXISTS hidden_objects (
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON hidden_objects TO uchet_app;
 
-INSERT INTO schema_migrations (filename) VALUES ('add_hidden_objects.sql') ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations (filename) VALUES ('007_add_hidden_objects.sql') ON CONFLICT DO NOTHING;
