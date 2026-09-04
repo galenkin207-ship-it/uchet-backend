@@ -47,8 +47,18 @@ export async function loadFullRequest(id) {
 requestsRouter.get(
   "/",
   requireAuth,
-  asyncHandler(async (_req, res) => {
-    const { rows } = await pool.query(`
+  asyncHandler(async (req, res) => {
+    // КРИТИЧНО: раньше этот эндпоинт отдавал ВСЕ заявки и ВСЮ переписку по ним
+    // любому авторизованному пользователю без исключений — видимость "прораб
+    // видит только свои заявки" была реализована ИСКЛЮЧИТЕЛЬНО на клиенте
+    // (фильтром по ФИО во фронтенде). Любой прораб, обратившись к этому
+    // эндпоинту напрямую (DevTools/curl со своей cookie), получал приватную
+    // переписку всех остальных прорабов с админом/куратором.
+    // Основная проверка — по submitted_by_user_id; fallback на ФИО — только
+    // для старых заявок, у которых он не заполнен (см. миграцию 013).
+    const isForeman = req.user.role === "user";
+    const { rows } = await pool.query(
+      `
       SELECT r.*,
         COALESCE(
           json_agg(
@@ -62,9 +72,12 @@ requestsRouter.get(
         ) AS comments
       FROM requests r
       LEFT JOIN request_comments c ON c.request_id = r.id
+      ${isForeman ? "WHERE (r.submitted_by_user_id = $1 OR (r.submitted_by_user_id IS NULL AND r.submitted_by = $2))" : ""}
       GROUP BY r.id
       ORDER BY r.id DESC
-    `);
+    `,
+      isForeman ? [req.user.id, req.user.full_name] : [],
+    );
     res.json(rows);
   }),
 );
