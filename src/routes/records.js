@@ -211,14 +211,25 @@ recordsRouter.get(
   }),
 );
 
+// Возвращает { normalized, total, error } — error не null, если хотя бы одна
+// позиция имеет некорректные qty/price (не число, отрицательное, NaN/Infinity).
+// Раньше это никак не проверялось: Number(item.qty) * Number(item.price) от
+// произвольных значений могло дать NaN/отрицательную сумму, которая тихо
+// уходила в БД — колонки numeric формально это пропускают.
 function computeItemsAndTotal(items) {
   let total = 0;
+  let error = null;
   const normalized = (items || []).map((item) => {
-    const sum = Number(item.qty) * Number(item.price);
+    const qty = Number(item.qty);
+    const price = Number(item.price);
+    if (!Number.isFinite(qty) || qty < 0 || !Number.isFinite(price) || price < 0) {
+      error = `invalid qty/price for item "${item.name ?? ""}"`;
+    }
+    const sum = qty * price;
     total += sum;
     return { ...item, sum };
   });
-  return { normalized, total };
+  return { normalized, total, error };
 }
 
 recordsRouter.post("/", requireAuth, async (req, res) => {
@@ -227,7 +238,8 @@ recordsRouter.post("/", requireAuth, async (req, res) => {
   if (status === "done" && !object_name) {
     return res.status(400).json({ error: "object is required to complete a record" });
   }
-  const { normalized, total } = computeItemsAndTotal(items);
+  const { normalized, total, error } = computeItemsAndTotal(items);
+  if (error) return res.status(400).json({ error });
   if (status === "done" && !normalized.length) return res.status(400).json({ error: "no valid items" });
 
   const client = await pool.connect();
@@ -283,7 +295,8 @@ recordsRouter.put("/:id", requireAuth, async (req, res) => {
   if (!canModify(existing, req.user)) return res.status(403).json({ error: "forbidden" });
 
   const { object_id, object_name, employees = [], date, items, comment = "", status } = req.body || {};
-  const { normalized, total } = computeItemsAndTotal(items);
+  const { normalized, total, error } = computeItemsAndTotal(items);
+  if (error) return res.status(400).json({ error });
   if ((status || existing.status) === "done" && !normalized.length) {
     return res.status(400).json({ error: "no valid items" });
   }

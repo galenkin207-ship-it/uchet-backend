@@ -303,6 +303,9 @@ requestsRouter.put(
     if (!before) return res.status(404).json({ error: "not found" });
 
     const { status, resolved_name, resolved_unit, resolved_price, reject_reason } = req.body || {};
+    if (resolved_price != null && (!Number.isFinite(Number(resolved_price)) || Number(resolved_price) < 0)) {
+      return res.status(400).json({ error: "resolved_price must be a non-negative number" });
+    }
     const { rows } = await pool.query(
       `UPDATE requests SET
          status = COALESCE($1, status),

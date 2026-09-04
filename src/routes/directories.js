@@ -323,11 +323,19 @@ async function cascadeWorkTypeUpdate(client, updated) {
   );
 }
 
+function validatePrice(price) {
+  if (price == null) return null;
+  const n = Number(price);
+  if (!Number.isFinite(n) || n < 0) return "Цена должна быть неотрицательным числом";
+  return null;
+}
+
 export const workTypesRouter = makeDirectoryRouter({
   table: "work_types",
   columns: ["name", "unit", "price"],
   entityType: "work_type",
   afterUpdate: cascadeWorkTypeUpdate,
+  validate: (_pool, body) => validatePrice(body.price),
 });
 
 // Одобрение заявки раньше всегда безусловно вставляло новую строку в
