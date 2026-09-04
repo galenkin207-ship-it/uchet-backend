@@ -2,25 +2,39 @@ import crypto from "node:crypto";
 import bcrypt from "bcrypt";
 import { pool } from "./db.js";
 
+// Падаем сразу и громко на старте, если секрет не задан, вместо того чтобы
+// молча дожить до первого логина/запроса с cookie и упасть там (см. .env.example).
+const SESSION_SECRET = process.env.SESSION_SECRET;
+if (!SESSION_SECRET) {
+  throw new Error(
+    "SESSION_SECRET не задан в .env — без него нельзя подписывать сессии. См. .env.example.",
+  );
+}
+
 const COOKIE_NAME = "uchet_session";
 const MAX_AGE_MS = 1000 * 60 * 60 * 24 * 365; // 1 год, как в старом приложении
 
 function sign(userId) {
-  const secret = process.env.SESSION_SECRET;
   const payload = `${userId}.${Date.now() + MAX_AGE_MS}`;
-  const hmac = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  const hmac = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
   return `${payload}.${hmac}`;
 }
 
 function verify(token) {
   if (!token) return null;
-  const secret = process.env.SESSION_SECRET;
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   const [userId, expiresAt, hmac] = parts;
   const payload = `${userId}.${expiresAt}`;
-  const expected = crypto.createHmac("sha256", secret).update(payload).digest("hex");
-  if (!crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(expected))) return null;
+  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+  const hmacBuf = Buffer.from(hmac);
+  const expectedBuf = Buffer.from(expected);
+  // crypto.timingSafeEqual требует буферы одинаковой длины и иначе бросает
+  // RangeError — а hmac полностью подконтролен клиенту через cookie. Раньше
+  // подделанная/битая cookie с hmac другой длины валила verify() необработанным
+  // исключением ещё до try/catch в attachUser, и запрос зависал без ответа.
+  if (hmacBuf.length !== expectedBuf.length) return null;
+  if (!crypto.timingSafeEqual(hmacBuf, expectedBuf)) return null;
   if (Date.now() > Number(expiresAt)) return null;
   return Number(userId);
 }
@@ -41,7 +55,15 @@ export function clearSessionCookie(res) {
 
 // Middleware: подкладывает req.user, если сессия валидна. Не требует авторизации сам по себе.
 export async function attachUser(req, _res, next) {
-  const userId = verify(req.cookies?.[COOKIE_NAME]);
+  let userId = null;
+  try {
+    userId = verify(req.cookies?.[COOKIE_NAME]);
+  } catch (err) {
+    // Доп. подстраховка: даже если в verify() когда-нибудь снова попадёт
+    // непредвиденный throw, запрос не должен зависать без ответа.
+    console.error("attachUser verify error:", err);
+    userId = null;
+  }
   if (!userId) {
     req.user = null;
     return next();

@@ -3,6 +3,7 @@ import cookieParser from "cookie-parser";
 import cors from "cors";
 import "dotenv/config";
 
+import { pool } from "./db.js";
 import { attachUser } from "./auth.js";
 import { authRouter } from "./routes/auth.js";
 import { objectsRouter, employeesRouter, unitsRouter, workTypesRouter } from "./routes/directories.js";
@@ -31,7 +32,19 @@ app.use(express.json({ limit: "2mb" }));
 app.use(cookieParser());
 app.use(attachUser);
 
-app.get("/api/health", (_req, res) => res.json({ ok: true, version: "1.0.1" }));
+// Раньше просто отвечал {ok:true} без обращения к БД — деплой-скрипт
+// (.github/workflows/deploy*.yml) полагается на этот эндпоинт для авто-роллбэка,
+// поэтому сломанное подключение к БД (например, не применённая миграция или
+// забытый GRANT на новую таблицу) молча проходило как "успешный" деплой.
+app.get("/api/health", async (_req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ ok: true, version: "1.0.1" });
+  } catch (err) {
+    console.error("health check: БД недоступна:", err.message);
+    res.status(503).json({ ok: false, error: "database unavailable" });
+  }
+});
 
 app.use("/api", authRouter);
 app.use("/api/objects", objectsRouter);
