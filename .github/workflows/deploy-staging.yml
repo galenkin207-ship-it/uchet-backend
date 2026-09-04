@@ -57,7 +57,7 @@ jobs:
             cd /opt/uchet-staging/backend-src || rollback
             echo "Проверяю, что все SQL-миграции применены на staging..."
             node scripts/check-migrations.js || rollback
-            npm_config_cache=/opt/npm-cache npm install --omit=dev || rollback
+            npm_config_cache=/opt/npm-cache npm ci --omit=dev || rollback
             node --check src/index.js || rollback
             sudo systemctl restart uchet-backend-staging || rollback
             sudo systemctl is-active uchet-backend-staging || rollback
