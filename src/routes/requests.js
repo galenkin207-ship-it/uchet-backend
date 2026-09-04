@@ -4,6 +4,7 @@ import { requireAuth, requireRole } from "../auth.js";
 import { sendPushToRole, sendPushToUser } from "../push-notify.js";
 import { insertAuditLog } from "../audit.js";
 import { asyncHandler } from "../async-handler.js";
+import { upsertWorkTypeByName } from "./directories.js";
 
 export const requestsRouter = Router();
 
@@ -313,12 +314,18 @@ requestsRouter.put(
     );
     if (!rows[0]) return res.status(404).json({ error: "not found" });
 
-    // Одобренная заявка автоматически добавляется в справочник видов работ.
+    // Одобренная заявка автоматически добавляется в справочник видов работ —
+    // upsertWorkTypeByName сам решит, обновить существующий по имени или
+    // создать новый (и сам же напишет в audit_log с каскадным пересчётом,
+    // если обновляет — см. directories.js).
     if (status === "approved" && resolved_name && resolved_unit && resolved_price != null) {
-      await pool.query(
-        `INSERT INTO work_types (name, unit, price) VALUES ($1,$2,$3)`,
-        [resolved_name, resolved_unit, resolved_price],
-      );
+      await upsertWorkTypeByName({
+        name: resolved_name,
+        unit: resolved_unit,
+        price: resolved_price,
+        actorUserId: req.user.id,
+        actorName: req.user.full_name,
+      });
     }
 
     await insertAuditLog(pool, {

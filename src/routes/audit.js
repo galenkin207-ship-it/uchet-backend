@@ -2,7 +2,7 @@ import { Router } from "express";
 import { pool } from "../db.js";
 import { requireRole } from "../auth.js";
 import { insertAuditLog } from "../audit.js";
-import { loadFullRecord, restorePhotosFromTrash } from "./records.js";
+import { loadFullRecord, restorePhotosFromTrash, photoFileExists } from "./records.js";
 import { loadFullRequest } from "./requests.js";
 
 export const auditRouter = Router();
@@ -131,6 +131,27 @@ async function restoreRecord(id, snapshot) {
         ],
       );
       await client.query(`DELETE FROM record_items WHERE record_id = $1`, [id]);
+
+      // Фото раньше вообще не трогались в этой ветке (запись существует, только
+      // отредактирована) — восстанавливались только items/поля, а список фото
+      // оставался "текущим", даже если он не совпадал со снимком "до". Приводим
+      // record_photos к снимку — как и с items, полная замена. Восстановить
+      // получится только те файлы, что физически ещё на диске: индивидуальное
+      // удаление одной фотографии стирает файл сразу, без корзины, и такую
+      // фотографию восстановить нельзя, только оставить пропущенной.
+      await client.query(`DELETE FROM record_photos WHERE record_id = $1`, [id]);
+      let photoSortOrder = 0;
+      for (const filePath of snapshot.photos || []) {
+        if (!photoFileExists(filePath)) {
+          console.warn(`Restore записи ${id}: файл фото ${filePath} из снимка больше не существует на диске, пропущен`);
+          continue;
+        }
+        await client.query(
+          `INSERT INTO record_photos (record_id, file_path, sort_order) VALUES ($1,$2,$3)`,
+          [id, filePath, photoSortOrder],
+        );
+        photoSortOrder++;
+      }
     } else {
       // Запись была удалена — восстанавливаем строку с тем же id (последовательность
       // id не откатывается назад, так что коллизий с новыми записями не будет).
@@ -222,6 +243,21 @@ async function restoreRequest(id, snapshot) {
           id,
         ],
       );
+
+      // Переписка раньше вообще не трогалась в этой ветке (заявка существует,
+      // только изменена/мягко удалена) — восстанавливались только поля решения,
+      // а комментарии оставались "текущими", даже если после снимка кто-то
+      // успел написать/отредактировать/удалить сообщение. Приводим переписку
+      // к снимку — как и с items записи в restoreRecord, полная замена: старые
+      // строки удаляются, комментарии из снимка вставляются заново (с новыми id).
+      await client.query(`DELETE FROM request_comments WHERE request_id = $1`, [id]);
+      for (const c of snapshot.comments || []) {
+        await client.query(
+          `INSERT INTO request_comments (request_id, author, author_user_id, text, created_at, edited_at)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [id, c.author, c.author_user_id, c.text, c.created_at, c.edited_at || null],
+        );
+      }
     } else {
       // Заявка была удалена насовсем (admin) — восстанавливаем строку и переписку.
       // snapshot.submitted_by_user_id может отсутствовать в очень старых снимках
