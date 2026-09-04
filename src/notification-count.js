@@ -9,10 +9,10 @@ import { pool } from "./db.js";
  */
 export async function computeUnreadCount(user) {
   const { rows: allRequests } = await pool.query(`
-    SELECT r.id, r.submitted_by, r.status,
+    SELECT r.id, r.submitted_by, r.submitted_by_user_id, r.status,
       COALESCE(
         json_agg(
-          json_build_object('id', c.id, 'author', c.author)
+          json_build_object('id', c.id, 'author', c.author, 'author_user_id', c.author_user_id)
           ORDER BY c.created_at
         ) FILTER (WHERE c.id IS NOT NULL),
         '[]'
@@ -22,19 +22,25 @@ export async function computeUnreadCount(user) {
     GROUP BY r.id
   `);
 
+  // "Моя заявка" — по user_id, если он известен; на старые заявки без
+  // привязки (пользователь с тех пор удалён) — fallback на сравнение по ФИО.
+  function isMine(authorUserId, authorName) {
+    return authorUserId != null ? authorUserId === user.id : authorName === user.full_name;
+  }
+
   const isForeman = user.role === "user";
   const visible = isForeman
-    ? allRequests.filter((r) => r.submitted_by === user.full_name)
+    ? allRequests.filter((r) => isMine(r.submitted_by_user_id, r.submitted_by))
     : allRequests;
 
   const items = [];
   for (const r of visible) {
-    items.push({ id: `${r.id}-new`, author: r.submitted_by });
+    items.push({ id: `${r.id}-new`, authorUserId: r.submitted_by_user_id, author: r.submitted_by });
     if (r.status === "deleted") {
-      items.push({ id: `${r.id}-deleted`, author: r.submitted_by });
+      items.push({ id: `${r.id}-deleted`, authorUserId: r.submitted_by_user_id, author: r.submitted_by });
     }
     for (const c of r.comments) {
-      items.push({ id: String(c.id), author: c.author });
+      items.push({ id: String(c.id), authorUserId: c.author_user_id, author: c.author });
     }
   }
 
@@ -46,7 +52,7 @@ export async function computeUnreadCount(user) {
 
   let count = 0;
   for (const item of items) {
-    if (item.author !== user.full_name && !readSet.has(item.id)) count += 1;
+    if (!isMine(item.authorUserId, item.author) && !readSet.has(item.id)) count += 1;
   }
   return count;
 }

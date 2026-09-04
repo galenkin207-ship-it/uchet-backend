@@ -4,6 +4,12 @@ import { requireAuth } from "../auth.js";
 
 export const notificationHidesRouter = Router();
 
+// Верхняя граница на размер пачки — без неё запрос с аномально большим
+// массивом ids (баг на фронтенде, кривой скрипт) упирался бы в лимит
+// Postgres на число параметров одного запроса (65535) и падал с ошибкой БД
+// вместо понятного 400.
+const MAX_IDS_PER_REQUEST = 500;
+
 notificationHidesRouter.get("/", requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -21,6 +27,9 @@ notificationHidesRouter.post("/", requireAuth, async (req, res) => {
   try {
     const { ids } = req.body || {};
     if (!Array.isArray(ids) || ids.length === 0) return res.json({ ok: true });
+    if (ids.length > MAX_IDS_PER_REQUEST) {
+      return res.status(400).json({ error: `too many ids, max ${MAX_IDS_PER_REQUEST} per request` });
+    }
 
     const values = ids.map((_, i) => `($1, $${i + 2})`).join(",");
     await pool.query(

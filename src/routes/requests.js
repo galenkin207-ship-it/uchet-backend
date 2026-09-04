@@ -7,8 +7,11 @@ import { asyncHandler } from "../async-handler.js";
 
 export const requestsRouter = Router();
 
-// Ищем id пользователя по ФИО (requests.submitted_by хранит имя, а не id) —
-// нужен только для адресной push-рассылки, на основную логику не влияет.
+// Ищем id пользователя по ФИО — используется только как fallback для старых
+// заявок/сообщений, у которых почему-то не заполнен user_id (например,
+// пользователь с тех пор был удалён и submitted_by_user_id стал NULL через
+// ON DELETE SET NULL). Для всего нового — используется user_id напрямую,
+// без поиска по имени (см. миграцию 013_add_requests_submitted_by_user_id.sql).
 async function findUserIdByName(fullName) {
   if (!fullName) return null;
   const { rows } = await pool.query(`SELECT id FROM users WHERE full_name = $1 LIMIT 1`, [
@@ -86,7 +89,7 @@ requestsRouter.post(
 
     // Уведомляем "другую сторону" переписки — не самого отправителя.
     const { rows: reqInfo } = await pool.query(
-      `SELECT submitted_by, text FROM requests WHERE id = $1`,
+      `SELECT submitted_by, submitted_by_user_id, text FROM requests WHERE id = $1`,
       [req.params.id],
     );
     const parent = reqInfo[0];
@@ -96,10 +99,13 @@ requestsRouter.post(
         body: String(text).trim(),
         url: `/messages?request=${req.params.id}`,
       };
-      if (req.user.full_name === parent.submitted_by) {
+      const isParentAuthor = parent.submitted_by_user_id != null
+        ? parent.submitted_by_user_id === req.user.id
+        : parent.submitted_by === req.user.full_name;
+      if (isParentAuthor) {
         void sendPushToRole("admin", payload, req.user.id);
       } else {
-        const authorId = await findUserIdByName(parent.submitted_by);
+        const authorId = parent.submitted_by_user_id ?? (await findUserIdByName(parent.submitted_by));
         if (authorId) void sendPushToUser(authorId, payload);
       }
     }
@@ -176,7 +182,14 @@ requestsRouter.delete(
     const existing = await loadFullRequest(req.params.id);
     if (!existing) return res.status(404).json({ error: "not found" });
 
-    const isOwn = existing.submitted_by === req.user.full_name;
+    // Основная проверка — по submitted_by_user_id (надёжно, не зависит от
+    // совпадения ФИО у разных сотрудников). Fallback на сравнение по имени —
+    // только для случая, когда пользователь-автор с тех пор был удалён
+    // (submitted_by_user_id стал NULL через ON DELETE SET NULL) и восстановить
+    // однозначную привязку уже нельзя.
+    const isOwn = existing.submitted_by_user_id != null
+      ? existing.submitted_by_user_id === req.user.id
+      : existing.submitted_by === req.user.full_name;
     if (!isOwn && req.user.role !== "admin") {
       return res.status(403).json({ error: "not allowed" });
     }
@@ -223,7 +236,7 @@ requestsRouter.delete(
       after: null,
     });
     res.json({ id: existing.id, deleted: true });
-    const authorId = await findUserIdByName(existing.submitted_by);
+    const authorId = existing.submitted_by_user_id ?? (await findUserIdByName(existing.submitted_by));
     if (authorId) {
       void sendPushToUser(authorId, {
         title: "Ваша заявка удалена администратором",
@@ -241,8 +254,8 @@ requestsRouter.post(
     const { text } = req.body || {};
     if (!text) return res.status(400).json({ error: "text is required" });
     const { rows } = await pool.query(
-      `INSERT INTO requests (text, submitted_by, status) VALUES ($1,$2,'pending') RETURNING *`,
-      [text, req.user.full_name],
+      `INSERT INTO requests (text, submitted_by, submitted_by_user_id, status) VALUES ($1,$2,$3,'pending') RETURNING *`,
+      [text, req.user.full_name, req.user.id],
     );
     await insertAuditLog(pool, {
       entityType: "request",
@@ -320,7 +333,7 @@ requestsRouter.put(
 
     res.json(rows[0]);
 
-    const authorId = await findUserIdByName(rows[0].submitted_by);
+    const authorId = rows[0].submitted_by_user_id ?? (await findUserIdByName(rows[0].submitted_by));
     if (authorId && (status === "approved" || status === "rejected")) {
       void sendPushToUser(authorId, {
         title: status === "approved" ? "Заявка одобрена" : "Заявка отклонена",
