@@ -6,8 +6,12 @@ import { asyncHandler } from "../async-handler.js";
 
 // Небольшой генератор CRUD-роутера для простых справочников вида
 // { id, name, ... } — objects, employees, units, work_types.
-// Изменять (создавать/править/удалять) могут только curator/admin,
-// читать — любой авторизованный пользователь.
+// Изменять (создавать/править/удалять) может только admin — куратор в
+// управлении справочниками не участвует (единственный интерфейс для этого,
+// раздел "Управление", доступен только администратору; отдельно от этого
+// куратор по-прежнему может архивировать/восстанавливать объект — см.
+// objectsRouter.patch("/:id/archive"/"/restore") ниже, у них своя проверка роли).
+// Читать справочники — любой авторизованный пользователь.
 //
 // entityType — если указан, каждое create/update/delete пишет запись в
 // audit_log (см. src/audit.js). До этой правки справочники были единственным
@@ -40,7 +44,7 @@ function makeDirectoryRouter({
 
   router.post(
     "/",
-    requireRole("curator", "admin"),
+    requireRole("admin"),
     asyncHandler(async (req, res) => {
       // validate — необязательная проверка перед записью (например, уникальность
       // по имени без учёта регистра/пробелов). Возвращает текст ошибки или null.
@@ -71,7 +75,7 @@ function makeDirectoryRouter({
 
   router.put(
     "/:id",
-    requireRole("curator", "admin"),
+    requireRole("admin"),
     asyncHandler(async (req, res) => {
       if (validate) {
         const error = await validate(pool, req.body, req.params.id);
