@@ -5,4 +5,4 @@
 -- выбрать в этом фильтре).
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_submitter BOOLEAN NOT NULL DEFAULT false;
 
-INSERT INTO schema_migrations (filename) VALUES ('add_users_is_submitter.sql') ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations (filename) VALUES ('012_add_users_is_submitter.sql') ON CONFLICT DO NOTHING;

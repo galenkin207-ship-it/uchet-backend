@@ -12,4 +12,4 @@ CREATE TABLE IF NOT EXISTS notification_hides (
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON notification_hides TO uchet_app;
 
-INSERT INTO schema_migrations (filename) VALUES ('add_notification_hides.sql') ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations (filename) VALUES ('008_add_notification_hides.sql') ON CONFLICT DO NOTHING;

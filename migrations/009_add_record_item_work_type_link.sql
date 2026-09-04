@@ -14,4 +14,4 @@ ALTER TABLE record_items
 
 CREATE INDEX IF NOT EXISTS record_items_work_type_id_idx ON record_items(work_type_id);
 
-INSERT INTO schema_migrations (filename) VALUES ('add_record_item_work_type_link.sql') ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations (filename) VALUES ('009_add_record_item_work_type_link.sql') ON CONFLICT DO NOTHING;

@@ -15,3 +15,5 @@ CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user_id ON push_subscriptions(
 -- Права для прикладного пользователя БД (без этого — Postgres aclcheck_error при первом запросе).
 GRANT SELECT, INSERT, UPDATE, DELETE ON push_subscriptions TO uchet_app;
 GRANT USAGE, SELECT ON SEQUENCE push_subscriptions_id_seq TO uchet_app;
+
+INSERT INTO schema_migrations (filename) VALUES ('005_add_push_subscriptions.sql') ON CONFLICT DO NOTHING;

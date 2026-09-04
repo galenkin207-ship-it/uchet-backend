@@ -18,4 +18,4 @@ CREATE INDEX IF NOT EXISTS idx_brigades_user_id ON brigades(user_id);
 GRANT SELECT, INSERT, UPDATE, DELETE ON brigades TO uchet_app;
 GRANT USAGE, SELECT ON SEQUENCE brigades_id_seq TO uchet_app;
 
-INSERT INTO schema_migrations (filename) VALUES ('add_brigades.sql') ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations (filename) VALUES ('006_add_brigades.sql') ON CONFLICT DO NOTHING;

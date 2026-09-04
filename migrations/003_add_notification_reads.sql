@@ -28,3 +28,5 @@ INSERT INTO notification_reads (user_id, item_id)
 SELECT u.id, c.id::text
 FROM users u CROSS JOIN request_comments c
 ON CONFLICT DO NOTHING;
+
+INSERT INTO schema_migrations (filename) VALUES ('003_add_notification_reads.sql') ON CONFLICT DO NOTHING;
