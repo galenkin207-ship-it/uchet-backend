@@ -291,34 +291,101 @@ export const unitsRouter = makeDirectoryRouter({
   entityType: "unit",
 });
 
+// Каскадный пересчёт: название/единица/цена вида работы всегда должны
+// совпадать с тем, что показано во всех записях, где он использован —
+// в т.ч. уже завершённых (done). Прежние значения нигде не сохраняются
+// (по явному решению — история изменений цен не нужна), но сам факт
+// изменения остаётся в audit_log.
+//
+// Вынесено в отдельную функцию, чтобы использовать её из двух мест:
+// обновление через справочник (см. workTypesRouter ниже) и авто-обновление
+// при одобрении заявки (см. upsertWorkTypeByName и requests.js) — раньше
+// эти два пути были рассинхронизированы: одобрение заявки писало цену
+// напрямую в work_types в обход и каскада, и audit_log.
+async function cascadeWorkTypeUpdate(client, updated) {
+  await client.query(
+    `UPDATE record_items
+        SET name = $1, unit = $2, price = $3, sum = qty * $3
+      WHERE work_type_id = $4`,
+    [updated.name, updated.unit, updated.price, updated.id],
+  );
+  await client.query(
+    `UPDATE records r
+        SET total = sub.total
+       FROM (
+         SELECT record_id, COALESCE(SUM(sum), 0) AS total
+         FROM record_items
+         WHERE record_id IN (SELECT DISTINCT record_id FROM record_items WHERE work_type_id = $1)
+         GROUP BY record_id
+       ) sub
+      WHERE r.id = sub.record_id`,
+    [updated.id],
+  );
+}
+
 export const workTypesRouter = makeDirectoryRouter({
   table: "work_types",
   columns: ["name", "unit", "price"],
   entityType: "work_type",
-  afterUpdate: async (client, updated) => {
-    // Каскадный пересчёт: название/единица/цена вида работы всегда должны
-    // совпадать с тем, что показано во всех записях, где он использован —
-    // в т.ч. уже завершённых (done). Прежние значения нигде не сохраняются
-    // (по явному решению — история изменений цен не нужна) — но теперь сам
-    // факт изменения и то, каким было прежнее значение, остаётся в audit_log
-    // (см. entityType выше и запись insertAuditLog в общем PUT-обработчике).
-    await client.query(
-      `UPDATE record_items
-          SET name = $1, unit = $2, price = $3, sum = qty * $3
-        WHERE work_type_id = $4`,
-      [updated.name, updated.unit, updated.price, updated.id],
-    );
-    await client.query(
-      `UPDATE records r
-          SET total = sub.total
-         FROM (
-           SELECT record_id, COALESCE(SUM(sum), 0) AS total
-           FROM record_items
-           WHERE record_id IN (SELECT DISTINCT record_id FROM record_items WHERE work_type_id = $1)
-           GROUP BY record_id
-         ) sub
-        WHERE r.id = sub.record_id`,
-      [updated.id],
-    );
-  },
+  afterUpdate: cascadeWorkTypeUpdate,
 });
+
+// Одобрение заявки раньше всегда безусловно вставляло новую строку в
+// work_types, даже если вид работы с таким названием уже существовал —
+// из-за этого в справочнике накапливались дубли с одинаковым названием и
+// разными ценами (обнаружено на практике: два одноимённых вида работы с
+// разными ценами на staging). Теперь сначала ищем существующий по имени
+// (без учёта регистра/пробелов, как и везде в справочниках) и обновляем
+// его — с тем же каскадом и той же audit-записью, что и ручное редактирование
+// через справочник — вместо создания дубля.
+export async function upsertWorkTypeByName({ name, unit, price, actorUserId, actorName }) {
+  const trimmedName = String(name).trim();
+  const { rows: existingRows } = await pool.query(
+    `SELECT id, name, unit, price FROM work_types WHERE lower(btrim(name)) = lower(btrim($1))`,
+    [trimmedName],
+  );
+
+  if (existingRows[0]) {
+    const before = existingRows[0];
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const { rows } = await client.query(
+        `UPDATE work_types SET unit = $1, price = $2 WHERE id = $3 RETURNING id, name, unit, price`,
+        [unit, price, before.id],
+      );
+      await cascadeWorkTypeUpdate(client, rows[0]);
+      await insertAuditLog(client, {
+        entityType: "work_type",
+        entityId: rows[0].id,
+        action: "update",
+        actorUserId,
+        actorName,
+        before,
+        after: rows[0],
+      });
+      await client.query("COMMIT");
+      return rows[0];
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  const { rows } = await pool.query(
+    `INSERT INTO work_types (name, unit, price) VALUES ($1,$2,$3) RETURNING id, name, unit, price`,
+    [trimmedName, unit, price],
+  );
+  await insertAuditLog(pool, {
+    entityType: "work_type",
+    entityId: rows[0].id,
+    action: "create",
+    actorUserId,
+    actorName,
+    before: null,
+    after: rows[0],
+  });
+  return rows[0];
+}
