@@ -58,14 +58,40 @@ export function photoFileExists(relativePath) {
   return fs.existsSync(path.join(PHOTOS_DIR, relativePath));
 }
 
-const PHOTO_MAX_PER_RECORD = 12;
+const PHOTO_MAX_PER_RECORD = 30;
 const PHOTO_MAX_DIMENSION = 1920;
 const ALLOWED_EXT = new Set([".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"]);
+// ВАЖНО: должно совпадать с PHOTO_MAX_RAW_SIZE_BYTES на фронтенде
+// (pixel-perfect-view-518/src/components/app/record-form.tsx). Раньше тут
+// стояло 15 МБ, а на фронтенде клиентская проверка пропускала файлы до 30 МБ —
+// несжимаемые HEIC/JPEG с современных телефонов (48 Мп камера, панорамы)
+// проходили клиентскую проверку, но падали здесь с невнятной 500-й ошибкой,
+// а заодно из-за multer.array() валили ВЕСЬ пакет фото в этом запросе, включая
+// остальные нормальные снимки — отсюда жалобы "не все фото загрузились".
+const PHOTO_MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024;
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024, files: PHOTO_MAX_PER_RECORD },
+  limits: { fileSize: PHOTO_MAX_FILE_SIZE_BYTES, files: PHOTO_MAX_PER_RECORD },
 });
+
+// Превращает ошибки multer (файл/пакет превышают лимит, слишком много файлов
+// и т.п.) в понятный ответ вместо общего "internal server error" из
+// глобального обработчика в app.js — раньше пользователь не мог понять,
+// что именно пошло не так, и повторная попытка с тем же файлом заведомо
+// повторяла ту же ошибку.
+function handlePhotoUploadErrors(err, _req, res, next) {
+  if (!err) return next();
+  if (err.code === "LIMIT_FILE_SIZE") {
+    const mb = Math.round(PHOTO_MAX_FILE_SIZE_BYTES / (1024 * 1024));
+    return res.status(413).json({ error: `файл превышает максимальный размер ${mb} МБ` });
+  }
+  if (err.code === "LIMIT_FILE_COUNT" || err.code === "LIMIT_UNEXPECTED_FILE") {
+    return res.status(400).json({ error: `максимум ${PHOTO_MAX_PER_RECORD} фото за раз` });
+  }
+  console.error("Ошибка загрузки фото:", err);
+  return res.status(500).json({ error: "не удалось загрузить фото" });
+}
 
 export const recordsRouter = Router();
 
@@ -409,6 +435,7 @@ recordsRouter.post(
   "/:id/photos",
   requireAuth,
   upload.array("photos", PHOTO_MAX_PER_RECORD),
+  handlePhotoUploadErrors,
   asyncHandler(async (req, res) => {
     const existing = await loadFullRecord(req.params.id);
     if (!existing) return res.status(404).json({ error: "not found" });
@@ -432,9 +459,16 @@ recordsRouter.post(
     }
 
     const saved = [];
+    const skipped = []; // имена файлов с неподдерживаемым расширением/не
+    // сохранившихся — раньше пропускались через continue молча, и
+    // пользователь не понимал, почему именно этого фото нет в записи
+    // ("не все фото присутствуют")
     for (const file of files) {
       const ext = path.extname(file.originalname).toLowerCase();
-      if (!ALLOWED_EXT.has(ext)) continue;
+      if (!ALLOWED_EXT.has(ext)) {
+        skipped.push(file.originalname);
+        continue;
+      }
       const fname = `${crypto.randomUUID().replace(/-/g, "")}.jpg`;
       const destPath = path.join(dir, fname);
       try {
@@ -448,6 +482,7 @@ recordsRouter.post(
           fs.writeFileSync(destPath, file.buffer); // если sharp не смог разобрать формат — сохраняем как есть
         } catch (writeErr) {
           console.error(`Не удалось сохранить фото ${fname} записи ${req.params.id}:`, writeErr);
+          skipped.push(file.originalname);
           continue; // пропускаем это фото, но не роняем весь запрос/процесс
         }
       }
@@ -460,7 +495,7 @@ recordsRouter.post(
 
     if (!saved.length) return res.status(400).json({ error: "no valid image files" });
     const full = await loadFullRecord(req.params.id);
-    res.status(201).json({ photos: full.photos, added: saved });
+    res.status(201).json({ photos: full.photos, added: saved, skipped });
   }),
 );
 
