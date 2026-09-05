@@ -35,6 +35,11 @@ authRouter.post("/logout", (req, res) => {
 });
 
 authRouter.get("/me", (req, res) => {
+  // См. attachUser в auth.js: dbUnavailable значит "БД на секунду недоступна",
+  // а не "сессия невалидна" — это должно быть 503, а не 401, иначе фронтенд
+  // разлогинивает пользователя с рабочей сессией из-за временного сбоя БД
+  // (типично сразу после рестарта бэкенда при деплое).
+  if (req.dbUnavailable) return res.status(503).json({ error: "db_unavailable" });
   if (!req.user) return res.status(401).json({ error: "unauthorized" });
   res.json(req.user);
 });

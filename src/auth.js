@@ -76,18 +76,28 @@ export async function attachUser(req, _res, next) {
     req.user = rows[0] && rows[0].active ? rows[0] : null;
   } catch (err) {
     console.error("attachUser db error:", err);
+    // Важно: это НЕ значит "сессия невалидна" — кука вполне может быть
+    // рабочей, просто БД на секунду недоступна (типичный случай — рестарт
+    // бэкенда при деплое, пока пул соединений ещё не прогрелся). Если тут
+    // просто выставить req.user = null, ниже по цепочке requireAuth ответит
+    // обычным 401, а фронтенд (см. api-client.ts SESSION_EXPIRED_EVENT)
+    // трактует любой 401 как истёкшую сессию и разлогинивает пользователя,
+    // хотя по факту достаточно было просто повторить запрос через момент.
     req.user = null;
+    req.dbUnavailable = true;
   }
   next();
 }
 
 export function requireAuth(req, res, next) {
+  if (req.dbUnavailable) return res.status(503).json({ error: "db_unavailable" });
   if (!req.user) return res.status(401).json({ error: "unauthorized" });
   next();
 }
 
 export function requireRole(...roles) {
   return (req, res, next) => {
+    if (req.dbUnavailable) return res.status(503).json({ error: "db_unavailable" });
     if (!req.user) return res.status(401).json({ error: "unauthorized" });
     if (!roles.includes(req.user.role)) return res.status(403).json({ error: "forbidden" });
     next();
