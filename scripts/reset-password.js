@@ -17,12 +17,12 @@ const MIN_PASSWORD_LENGTH = 6;
 
 async function listUsers() {
   const { rows } = await pool.query(
-    `SELECT login, full_name, role, active FROM users ORDER BY role, login`,
+    `SELECT login, full_name, role, active, email FROM users ORDER BY role, login`,
   );
   console.log("Логин не указан. Пользователи в этой базе:\n");
   for (const u of rows) {
     console.log(
-      `  ${u.login.padEnd(20)} ${u.full_name.padEnd(30)} ${u.role}${u.active ? "" : "  (неактивен)"}`,
+      `  ${u.login.padEnd(20)} ${u.full_name.padEnd(30)} ${u.role.padEnd(10)} ${u.email ?? "(без email)"}${u.active ? "" : "  (неактивен)"}`,
     );
   }
   console.log("\nЗапустите: node scripts/reset-password.js <логин> <новый_пароль>");
