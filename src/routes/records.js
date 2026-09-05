@@ -58,7 +58,7 @@ export function photoFileExists(relativePath) {
   return fs.existsSync(path.join(PHOTOS_DIR, relativePath));
 }
 
-const PHOTO_MAX_PER_RECORD = 12;
+const PHOTO_MAX_PER_RECORD = 30;
 const PHOTO_MAX_DIMENSION = 1920;
 const ALLOWED_EXT = new Set([".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"]);
 // ВАЖНО: должно совпадать с PHOTO_MAX_RAW_SIZE_BYTES на фронтенде
