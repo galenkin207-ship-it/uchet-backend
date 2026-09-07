@@ -123,6 +123,19 @@ usersRouter.put(
       ],
     );
     if (!rows[0]) return res.status(404).json({ error: "not found" });
+
+    // Админ только что задал новый пароль — гасим все неиспользованные
+    // токены восстановления этого пользователя, иначе письмо "забыли пароль",
+    // отправленное до этого сброса, могло бы позже перезаписать пароль,
+    // который только что установил админ (см. reset-password в auth.js,
+    // где точно так же гасятся "чужие" токены при использовании).
+    if (password_hash) {
+      await pool.query(
+        `UPDATE password_reset_tokens SET used_at = now() WHERE user_id = $1 AND used_at IS NULL`,
+        [req.params.id],
+      );
+    }
+
     res.json(rows[0]);
   }),
 );
