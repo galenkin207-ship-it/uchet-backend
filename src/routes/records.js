@@ -118,7 +118,7 @@ function canView(record, user) {
 // реальным объёмом данных могла упереться в сотни-тысячи последовательных
 // запросов при всего 10 соединениях в пуле (см. db.js), замедляя всё
 // приложение сразу для всех пользователей на время построения списка.
-async function loadRecordsByIds(ids) {
+export async function loadRecordsByIds(ids) {
   if (!ids.length) return [];
   const numericIds = ids.map(Number);
 
