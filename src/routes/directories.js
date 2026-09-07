@@ -3,6 +3,7 @@ import { pool } from "../db.js";
 import { requireAuth, requireRole } from "../auth.js";
 import { insertAuditLog } from "../audit.js";
 import { asyncHandler } from "../async-handler.js";
+import { loadRecordsByIds } from "./records.js";
 
 // Небольшой генератор CRUD-роутера для простых справочников вида
 // { id, name, ... } — objects, employees, units, work_types.
@@ -255,6 +256,122 @@ objectsRouter.patch(
       after: rows[0],
     });
     res.json(rows[0]);
+  }),
+);
+
+// Ключ группировки вида работ: по справочнику (work_type_id), а если
+// позиция не привязана к справочнику (старые записи) — по имени+ед.изм.
+function workKeyOf(item) {
+  return item.work_type_id != null ? `wt:${item.work_type_id}` : `nu:${item.name}||${item.unit}`;
+}
+
+// Загружает завершённые (status='done') записи объекта в опциональном
+// диапазоне дат — без общего лимита в 1000 (используемого в GET /records),
+// т.к. выборка уже сужена одним объектом.
+async function loadDoneRecordsForObject(objectId, from, to) {
+  const clauses = ["object_id = $1", "status = 'done'"];
+  const params = [objectId];
+  if (from) { params.push(from); clauses.push(`date >= $${params.length}`); }
+  if (to) { params.push(to); clauses.push(`date <= $${params.length}`); }
+  const { rows } = await pool.query(
+    `SELECT id FROM records WHERE ${clauses.join(" AND ")} ORDER BY date DESC, id DESC`,
+    params,
+  );
+  return loadRecordsByIds(rows.map((r) => r.id));
+}
+
+// Доли сотрудников по одной позиции: явные (manual) — из shares,
+// иначе — поровну между всеми employees записи. Отражает точно ту же
+// логику, что и allocationsFor() на фронтенде (lib/record-utils.ts).
+function employeeSharesOf(item, recordEmployees) {
+  if (item.shares && item.shares.length) {
+    return item.shares.map((s) => ({ employee: s.employee_name, qty: Number(s.qty) || 0 }));
+  }
+  const crew = recordEmployees || [];
+  if (!crew.length) return [];
+  const each = (Number(item.qty) || 0) / crew.length;
+  return crew.map((e) => ({ employee: e, qty: each }));
+}
+
+objectsRouter.get(
+  "/:id/work-summary",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { from, to } = req.query;
+    const records = await loadDoneRecordsForObject(req.params.id, from || null, to || null);
+    const map = new Map();
+    for (const r of records) {
+      for (const item of r.items) {
+        const key = workKeyOf(item);
+        const entry = map.get(key) ?? {
+          key,
+          name: item.name,
+          unit: item.unit,
+          work_type_id: item.work_type_id ?? null,
+          qty: 0,
+        };
+        entry.qty += Number(item.qty) || 0;
+        map.set(key, entry);
+      }
+    }
+    const positions = [...map.values()].sort((a, b) => a.name.localeCompare(b.name, "ru"));
+    res.json({ positions });
+  }),
+);
+
+objectsRouter.get(
+  "/:id/work-summary/:key",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { from, to } = req.query;
+    const records = await loadDoneRecordsForObject(req.params.id, from || null, to || null);
+    const days = new Set();
+    const employeeQty = new Map();
+    let name = null;
+    let unit = null;
+    let qty = 0;
+    for (const r of records) {
+      for (const item of r.items) {
+        if (workKeyOf(item) !== req.params.key) continue;
+        name = item.name;
+        unit = item.unit;
+        qty += Number(item.qty) || 0;
+        days.add(r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10));
+        for (const share of employeeSharesOf(item, r.employees)) {
+          if (!share.qty) continue;
+          employeeQty.set(share.employee, (employeeQty.get(share.employee) ?? 0) + share.qty);
+        }
+      }
+    }
+    if (name === null) return res.status(404).json({ error: "not found" });
+    const employees = [...employeeQty.entries()]
+      .map(([employee, empQty]) => ({ employee, qty: empQty }))
+      .sort((a, b) => b.qty - a.qty);
+    res.json({
+      key: req.params.key,
+      name,
+      unit,
+      qty,
+      days: days.size,
+      people_count: employees.length,
+      employees,
+    });
+  }),
+);
+
+objectsRouter.get(
+  "/:id/photos",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { from, to } = req.query;
+    const records = await loadDoneRecordsForObject(req.params.id, from || null, to || null);
+    const photos = [];
+    for (const r of records) {
+      for (const path of r.photos) {
+        photos.push({ record_id: r.id, date: r.date, file_path: path });
+      }
+    }
+    res.json({ photos });
   }),
 );
 
