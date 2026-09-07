@@ -314,27 +314,36 @@ objectsRouter.get(
         map.set(key, entry);
       }
     }
+    for (const entry of map.values()) {
+      entry.qty = Math.round(entry.qty * 1000) / 1000;
+    }
     const positions = [...map.values()].sort((a, b) => a.name.localeCompare(b.name, "ru"));
     res.json({ positions });
   }),
 );
 
 objectsRouter.get(
-  "/:id/work-summary/:key",
+  "/:id/work-summary-detail",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { from, to } = req.query;
+    const { from, to, work_type_id, name, unit } = req.query;
+    if (!work_type_id && !(name && unit)) {
+      return res.status(400).json({ error: "work_type_id or name+unit required" });
+    }
     const records = await loadDoneRecordsForObject(req.params.id, from || null, to || null);
+    const matches = (item) =>
+      work_type_id
+        ? String(item.work_type_id) === String(work_type_id)
+        : item.work_type_id == null && item.name === name && item.unit === unit;
+
     const days = new Set();
     const employeeQty = new Map();
-    let name = null;
-    let unit = null;
-    let qty = 0;
+    let foundName = null, foundUnit = null, qty = 0;
     for (const r of records) {
       for (const item of r.items) {
-        if (workKeyOf(item) !== req.params.key) continue;
-        name = item.name;
-        unit = item.unit;
+        if (!matches(item)) continue;
+        foundName = item.name;
+        foundUnit = item.unit;
         qty += Number(item.qty) || 0;
         days.add(r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date).slice(0, 10));
         for (const share of employeeSharesOf(item, r.employees)) {
@@ -343,15 +352,15 @@ objectsRouter.get(
         }
       }
     }
-    if (name === null) return res.status(404).json({ error: "not found" });
+    if (foundName === null) return res.status(404).json({ error: "not found" });
+    const round = (n) => Math.round(n * 1000) / 1000;
     const employees = [...employeeQty.entries()]
-      .map(([employee, empQty]) => ({ employee, qty: empQty }))
+      .map(([employee, empQty]) => ({ employee, qty: round(empQty) }))
       .sort((a, b) => b.qty - a.qty);
     res.json({
-      key: req.params.key,
-      name,
-      unit,
-      qty,
+      name: foundName,
+      unit: foundUnit,
+      qty: round(qty),
       days: days.size,
       people_count: employees.length,
       employees,
