@@ -330,6 +330,25 @@ requestsRouter.put(
     );
     if (!rows[0]) return res.status(404).json({ error: "not found" });
 
+    // Заявка обработана (одобрена/отклонена) — она больше не требует внимания
+    // куратора/админа, поэтому связанные с ней уведомления ("новая заявка" +
+    // вся переписка по ней) сразу помечаются прочитанными для всех, чтобы не
+    // зависали в списке непрочитанных после того, как решение уже принято.
+    if (status === "approved" || status === "rejected") {
+      await pool.query(
+        `INSERT INTO notification_reads (user_id, item_id)
+         SELECT u.id, item_id
+         FROM users u
+         CROSS JOIN (
+           SELECT $1 || '-new' AS item_id
+           UNION ALL
+           SELECT id::text FROM request_comments WHERE request_id = $2
+         ) items
+         ON CONFLICT DO NOTHING`,
+        [req.params.id, req.params.id],
+      );
+    }
+
     // Одобренная заявка автоматически добавляется в справочник видов работ —
     // upsertWorkTypeByName сам решит, обновить существующий по имени или
     // создать новый (и сам же напишет в audit_log с каскадным пересчётом,
