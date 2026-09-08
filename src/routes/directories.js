@@ -465,7 +465,11 @@ export const workTypesRouter = makeDirectoryRouter({
   columns: ["name", "unit", "price"],
   entityType: "work_type",
   afterUpdate: cascadeWorkTypeUpdate,
-  validate: (_pool, body) => validatePrice(body.price),
+  validate: async (pool, body, excludeId) => {
+    const nameError = await checkNameUnique(pool, "work_types", body.name, excludeId, "Вид работы");
+    if (nameError) return nameError;
+    return validatePrice(body.price);
+  },
 });
 
 // Одобрение заявки раньше всегда безусловно вставляло новую строку в
