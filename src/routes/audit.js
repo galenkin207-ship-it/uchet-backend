@@ -142,8 +142,8 @@ async function restoreRecord(id, snapshot) {
       await client.query(`DELETE FROM record_photos WHERE record_id = $1`, [id]);
       let photoSortOrder = 0;
       for (const filePath of snapshot.photos || []) {
-        if (!photoFileExists(filePath)) {
-          console.warn(`Restore записи ${id}: файл фото ${filePath} из снимка больше не существует на диске, пропущен`);
+        if (!(await photoFileExists(filePath))) {
+          console.warn(`Restore записи ${id}: файл фото ${filePath} из снимка больше не существует в S3, пропущен`);
           continue;
         }
         await client.query(
@@ -201,7 +201,7 @@ async function restoreRecord(id, snapshot) {
       // Фото восстанавливаем из корзины, куда их унёс DELETE (см. records.js).
       await client.query(`DELETE FROM record_photos WHERE record_id = $1`, [id]);
       const trashName = snapshot._photos_trash_dir;
-      if (trashName && restorePhotosFromTrash(id, trashName)) {
+      if (trashName && (await restorePhotosFromTrash(id, trashName))) {
         for (let i = 0; i < (snapshot.photos || []).length; i++) {
           await client.query(
             `INSERT INTO record_photos (record_id, file_path, sort_order) VALUES ($1,$2,$3)`,

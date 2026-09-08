@@ -1,5 +1,4 @@
 import { Router } from "express";
-import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import multer from "multer";
@@ -8,54 +7,49 @@ import { pool } from "../db.js";
 import { requireAuth } from "../auth.js";
 import { insertAuditLog } from "../audit.js";
 import { asyncHandler } from "../async-handler.js";
+import { putPhoto, getPresignedUrl, deleteObject, objectExists, copyObject, listByPrefix, deleteByPrefix } from "../s3.js";
 
-const PHOTOS_DIR = process.env.PHOTOS_DIR || "/opt/uchet/uploads/photos";
-fs.mkdirSync(PHOTOS_DIR, { recursive: true });
+// Корзина для фото удалённых записей: при удалении записи её объекты в S3 не
+// стираются сразу, а копируются сюда (префикс "trash/<trashName>/") — это
+// нужно, чтобы аудит-лог мог восстановить фото вместе с записью. Живёт до тех
+// пор, пока кто-то явно не восстановит запись; чистка старой корзины —
+// отдельная задача на будущее.
 
-// Корзина для фото удалённых записей: при удалении записи её папка с фото не
-// стирается сразу, а переносится сюда — это нужно, чтобы аудит-лог мог
-// восстановить фото вместе с записью. Живёт до тех пор, пока кто-то явно не
-// восстановит запись; чистка старой корзины — отдельная задача на будущее.
-const PHOTOS_TRASH_DIR = process.env.PHOTOS_TRASH_DIR || "/opt/uchet/uploads/photos-trash";
-fs.mkdirSync(PHOTOS_TRASH_DIR, { recursive: true });
-
-export function movePhotosToTrash(recordId) {
-  const srcDir = path.join(PHOTOS_DIR, String(recordId));
-  if (!fs.existsSync(srcDir)) return null;
+export async function movePhotosToTrash(recordId) {
+  const srcPrefix = `${recordId}/`;
+  const keys = await listByPrefix(srcPrefix);
+  if (!keys.length) return null;
   const trashName = `${recordId}-${Date.now()}`;
-  const destDir = path.join(PHOTOS_TRASH_DIR, trashName);
-  try {
-    fs.renameSync(srcDir, destDir);
-  } catch {
-    // На случай, если PHOTOS_DIR и PHOTOS_TRASH_DIR на разных ФС (EXDEV) — копируем и чистим исходник.
-    fs.cpSync(srcDir, destDir, { recursive: true });
-    fs.rmSync(srcDir, { recursive: true, force: true });
+  for (const key of keys) {
+    const filename = key.slice(srcPrefix.length);
+    await copyObject(key, `trash/${trashName}/${filename}`);
   }
+  await deleteByPrefix(srcPrefix);
   return trashName;
 }
 
-export function restorePhotosFromTrash(recordId, trashName) {
+export async function restorePhotosFromTrash(recordId, trashName) {
   if (!trashName) return false;
-  const srcDir = path.join(PHOTOS_TRASH_DIR, trashName);
-  if (!fs.existsSync(srcDir)) return false;
-  const destDir = path.join(PHOTOS_DIR, String(recordId));
-  try {
-    fs.renameSync(srcDir, destDir);
-  } catch {
-    fs.cpSync(srcDir, destDir, { recursive: true });
-    fs.rmSync(srcDir, { recursive: true, force: true });
+  const srcPrefix = `trash/${trashName}/`;
+  const keys = await listByPrefix(srcPrefix);
+  if (!keys.length) return false;
+  const destPrefix = `${recordId}/`;
+  for (const key of keys) {
+    const filename = key.slice(srcPrefix.length);
+    await copyObject(key, `${destPrefix}${filename}`);
   }
+  await deleteByPrefix(srcPrefix);
   return true;
 }
 
-// Проверяет, жив ли ещё файл фото на диске по относительному пути вида
+// Проверяет, жив ли ещё объект фото в S3 по относительному пути вида
 // "<recordId>/<filename>" (так, как он хранится в record_photos.file_path).
 // Нужно для restore из audit-log: индивидуальное удаление одной фотографии
-// (DELETE /:id/photos/:filename) стирает файл сразу, без корзины — в отличие
+// (DELETE /:id/photos/:filename) стирает объект сразу, без корзины — в отличие
 // от удаления всей записи. Если такую фотографию восстанавливать из старого
-// снимка "до", получится ссылка на несуществующий файл (404 при просмотре).
-export function photoFileExists(relativePath) {
-  return fs.existsSync(path.join(PHOTOS_DIR, relativePath));
+// снимка "до", получится ссылка на несуществующий объект (404 при просмотре).
+export async function photoFileExists(relativePath) {
+  return objectExists(relativePath);
 }
 
 const PHOTO_MAX_PER_RECORD = 30;
@@ -408,7 +402,7 @@ recordsRouter.delete(
     // Фото не стираем сразу, а уносим в корзину — так их можно вернуть при восстановлении.
     let trashName = null;
     try {
-      trashName = movePhotosToTrash(req.params.id);
+      trashName = await movePhotosToTrash(req.params.id);
     } catch (err) {
       // Права/диск подвели — запись всё равно уже удалена из БД, не роняем
       // процесс из-за отдельно взятой файловой операции с фото.
@@ -447,17 +441,6 @@ recordsRouter.post(
       return res.status(400).json({ error: `max ${PHOTO_MAX_PER_RECORD} photos per record` });
     }
 
-    const dir = path.join(PHOTOS_DIR, String(req.params.id));
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-    } catch (err) {
-      // Не даём одной ошибке прав/диска положить весь процесс для всех
-      // пользователей — раньше необработанное исключение здесь роняло
-      // uchet-backend.service целиком (см. systemd restart counter).
-      console.error(`Не удалось создать папку под фото записи ${req.params.id}:`, err);
-      return res.status(500).json({ error: "failed to create photos directory" });
-    }
-
     const saved = [];
     const skipped = []; // имена файлов с неподдерживаемым расширением/не
     // сохранившихся — раньше пропускались через continue молча, и
@@ -470,16 +453,17 @@ recordsRouter.post(
         continue;
       }
       const fname = `${crypto.randomUUID().replace(/-/g, "")}.jpg`;
-      const destPath = path.join(dir, fname);
       try {
-        await sharp(file.buffer)
+        const buffer = await sharp(file.buffer)
           .rotate() // авто-поворот по EXIF
           .resize({ width: PHOTO_MAX_DIMENSION, height: PHOTO_MAX_DIMENSION, fit: "inside", withoutEnlargement: true })
           .jpeg({ quality: 82 })
-          .toFile(destPath);
+          .toBuffer();
+        await putPhoto(`${req.params.id}/${fname}`, buffer, "image/jpeg");
       } catch {
         try {
-          fs.writeFileSync(destPath, file.buffer); // если sharp не смог разобрать формат — сохраняем как есть
+          // если sharp не смог разобрать формат — сохраняем как есть, с исходным content-type
+          await putPhoto(`${req.params.id}/${fname}`, file.buffer, file.mimetype || "application/octet-stream");
         } catch (writeErr) {
           console.error(`Не удалось сохранить фото ${fname} записи ${req.params.id}:`, writeErr);
           skipped.push(file.originalname);
@@ -507,11 +491,12 @@ recordsRouter.get(
     if (!record || !canView(record, req.user)) return res.status(404).json({ error: "not found" });
 
     const safeName = path.basename(req.params.filename);
-    const filePath = path.join(PHOTOS_DIR, String(req.params.id), safeName);
-    if (!filePath.startsWith(PHOTOS_DIR) || !fs.existsSync(filePath)) {
+    const relativePath = `${req.params.id}/${safeName}`;
+    if (!(await objectExists(relativePath))) {
       return res.status(404).json({ error: "not found" });
     }
-    res.sendFile(filePath);
+    const url = await getPresignedUrl(relativePath);
+    res.redirect(302, url);
   }),
 );
 
@@ -528,7 +513,9 @@ recordsRouter.delete(
       req.params.id,
       `${req.params.id}/${safeName}`,
     ]);
-    fs.rm(path.join(PHOTOS_DIR, String(req.params.id), safeName), () => {});
+    deleteObject(`${req.params.id}/${safeName}`).catch((err) => {
+      console.error(`Не удалось удалить фото ${safeName} записи ${req.params.id} из S3:`, err);
+    });
     res.json({ deleted: safeName });
   }),
 );
