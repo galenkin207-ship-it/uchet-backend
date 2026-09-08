@@ -453,6 +453,7 @@ recordsRouter.post(
         continue;
       }
       const fname = `${crypto.randomUUID().replace(/-/g, "")}.jpg`;
+      let resized = false;
       try {
         const buffer = await sharp(file.buffer)
           .rotate() // авто-поворот по EXIF
@@ -460,6 +461,7 @@ recordsRouter.post(
           .jpeg({ quality: 82 })
           .toBuffer();
         await putPhoto(`${req.params.id}/${fname}`, buffer, "image/jpeg");
+        resized = true;
       } catch {
         try {
           // если sharp не смог разобрать формат — сохраняем как есть, с исходным content-type
@@ -468,6 +470,21 @@ recordsRouter.post(
           console.error(`Не удалось сохранить фото ${fname} записи ${req.params.id}:`, writeErr);
           skipped.push(file.originalname);
           continue; // пропускаем это фото, но не роняем весь запрос/процесс
+        }
+      }
+      // Превью генерируем только когда основной sharp-пайплайн отработал —
+      // в fallback-ветке (сохранение as-is) исходник может быть в формате,
+      // который sharp не разобрал, так что превью для него всё равно не выйдет.
+      if (resized) {
+        try {
+          const thumbBuffer = await sharp(file.buffer)
+            .rotate()
+            .resize({ width: 400, height: 400, fit: "inside", withoutEnlargement: true })
+            .jpeg({ quality: 68 })
+            .toBuffer();
+          await putPhoto(`${req.params.id}/thumb_${fname}`, thumbBuffer, "image/jpeg");
+        } catch (thumbErr) {
+          console.error(`Не удалось сгенерировать превью для фото ${fname} записи ${req.params.id}:`, thumbErr);
         }
       }
       saved.push(fname);
@@ -492,6 +509,15 @@ recordsRouter.get(
 
     const safeName = path.basename(req.params.filename);
     const relativePath = `${req.params.id}/${safeName}`;
+
+    if (req.query.thumb === "1") {
+      const thumbPath = `${req.params.id}/thumb_${safeName}`;
+      if (await objectExists(thumbPath)) {
+        const thumbUrl = await getPresignedUrl(thumbPath);
+        return res.redirect(302, thumbUrl);
+      }
+    }
+
     if (!(await objectExists(relativePath))) {
       return res.status(404).json({ error: "not found" });
     }
@@ -515,6 +541,9 @@ recordsRouter.delete(
     ]);
     deleteObject(`${req.params.id}/${safeName}`).catch((err) => {
       console.error(`Не удалось удалить фото ${safeName} записи ${req.params.id} из S3:`, err);
+    });
+    deleteObject(`${req.params.id}/thumb_${safeName}`).catch((err) => {
+      console.error(`Не удалось удалить превью фото ${safeName} записи ${req.params.id} из S3:`, err);
     });
     res.json({ deleted: safeName });
   }),
