@@ -27,6 +27,7 @@ function makeDirectoryRouter({
   afterUpdate,
   validate,
   entityType,
+  listWhere,
 }) {
   const router = Router();
   const cols = columns.join(", ");
@@ -38,7 +39,10 @@ function makeDirectoryRouter({
     "/",
     requireAuth,
     asyncHandler(async (_req, res) => {
-      const { rows } = await pool.query(`SELECT id, ${selectCols} FROM ${table} ORDER BY ${orderBy}`);
+      // listWhere — необязательный SQL-фрагмент без параметров (например,
+      // скрыть архивные позиции из списка по умолчанию, см. workTypesRouter).
+      const where = listWhere ? ` WHERE ${listWhere}` : "";
+      const { rows } = await pool.query(`SELECT id, ${selectCols} FROM ${table}${where} ORDER BY ${orderBy}`);
       res.json(rows);
     }),
   );
@@ -463,6 +467,10 @@ function validatePrice(price) {
 export const workTypesRouter = makeDirectoryRouter({
   table: "work_types",
   columns: ["name", "unit", "price"],
+  extraSelect: ["status", "archived_at"],
+  // По умолчанию (справочник в Настройках, выбор вида работы при создании
+  // записи) архивные виды работ не показываются — как и архивные объекты.
+  listWhere: "status <> 'archived'",
   entityType: "work_type",
   afterUpdate: cascadeWorkTypeUpdate,
   validate: async (pool, body, excludeId) => {
@@ -471,6 +479,68 @@ export const workTypesRouter = makeDirectoryRouter({
     return validatePrice(body.price);
   },
 });
+
+// Архивация вместо жёсткого удаления — record_items.work_type_id уже
+// использованных видов работ не должен терять связь со справочником.
+// Паттерн — прямая копия objectsRouter.patch("/:id/archive"...) выше.
+workTypesRouter.patch(
+  "/:id/archive",
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const { rows: beforeRows } = await pool.query(
+      `SELECT id, name, unit, price, status, archived_at FROM work_types WHERE id = $1`,
+      [req.params.id],
+    );
+    if (!beforeRows[0]) return res.status(404).json({ error: "not found" });
+
+    const { rows } = await pool.query(
+      `UPDATE work_types SET status = 'archived', archived_at = now()
+       WHERE id = $1
+       RETURNING id, name, unit, price, status, archived_at`,
+      [req.params.id],
+    );
+    await insertAuditLog(pool, {
+      entityType: "work_type",
+      entityId: rows[0].id,
+      action: "update",
+      actorUserId: req.user.id,
+      actorName: req.user.full_name,
+      before: beforeRows[0],
+      after: rows[0],
+    });
+    res.json(rows[0]);
+  }),
+);
+
+// Возврат вида работы из архива обратно в активный справочник.
+workTypesRouter.patch(
+  "/:id/restore",
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const { rows: beforeRows } = await pool.query(
+      `SELECT id, name, unit, price, status, archived_at FROM work_types WHERE id = $1`,
+      [req.params.id],
+    );
+    if (!beforeRows[0]) return res.status(404).json({ error: "not found" });
+
+    const { rows } = await pool.query(
+      `UPDATE work_types SET status = 'active', archived_at = NULL
+       WHERE id = $1
+       RETURNING id, name, unit, price, status, archived_at`,
+      [req.params.id],
+    );
+    await insertAuditLog(pool, {
+      entityType: "work_type",
+      entityId: rows[0].id,
+      action: "update",
+      actorUserId: req.user.id,
+      actorName: req.user.full_name,
+      before: beforeRows[0],
+      after: rows[0],
+    });
+    res.json(rows[0]);
+  }),
+);
 
 // Одобрение заявки раньше всегда безусловно вставляло новую строку в
 // work_types, даже если вид работы с таким названием уже существовал —
@@ -483,17 +553,23 @@ export const workTypesRouter = makeDirectoryRouter({
 export async function upsertWorkTypeByName({ name, unit, price, actorUserId, actorName }) {
   const trimmedName = String(name).trim();
   const { rows: existingRows } = await pool.query(
-    `SELECT id, name, unit, price FROM work_types WHERE lower(btrim(name)) = lower(btrim($1))`,
+    `SELECT id, name, unit, price, status FROM work_types WHERE lower(btrim(name)) = lower(btrim($1))`,
     [trimmedName],
   );
 
   if (existingRows[0]) {
     const before = existingRows[0];
+    // Заявку могли одобрить с названием ранее заархивированного вида
+    // работы — он должен снова стать видимым и активным, а не остаться
+    // скрытым архивным с новыми записями на него.
+    const wasArchived = before.status === "archived";
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
       const { rows } = await client.query(
-        `UPDATE work_types SET unit = $1, price = $2 WHERE id = $3 RETURNING id, name, unit, price`,
+        wasArchived
+          ? `UPDATE work_types SET unit = $1, price = $2, status = 'active', archived_at = NULL WHERE id = $3 RETURNING id, name, unit, price`
+          : `UPDATE work_types SET unit = $1, price = $2 WHERE id = $3 RETURNING id, name, unit, price`,
         [unit, price, before.id],
       );
       await cascadeWorkTypeUpdate(client, rows[0]);
