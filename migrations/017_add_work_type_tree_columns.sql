@@ -26,8 +26,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_work_types_gesn_code ON work_types(gesn_co
 -- source='legacy_root' — чтобы повторный прогон файла (тем же способом,
 -- каким уже защищена вставка в schema_migrations ниже) не плодил вторую
 -- корневую строку.
-INSERT INTO work_types (name, status, level, source, sort_order)
-SELECT 'Существующие виды работ (до обновления)', 'active', 1, 'legacy_root', 0
+INSERT INTO work_types (name, unit, price, status, level, source, sort_order)
+SELECT 'Существующие виды работ (до обновления)', '-', 0, 'active', 1, 'legacy_root', 0
 WHERE NOT EXISTS (SELECT 1 FROM work_types WHERE source = 'legacy_root');
 
 UPDATE work_types
