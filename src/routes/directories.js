@@ -470,7 +470,7 @@ export const workTypesRouter = makeDirectoryRouter({
   extraSelect: ["status", "archived_at"],
   // По умолчанию (справочник в Настройках, выбор вида работы при создании
   // записи) архивные виды работ не показываются — как и архивные объекты.
-  listWhere: "status <> 'archived'",
+  listWhere: "status <> 'archived' AND source IN ('legacy', 'manual')",
   entityType: "work_type",
   afterUpdate: cascadeWorkTypeUpdate,
   validate: async (pool, body, excludeId) => {
