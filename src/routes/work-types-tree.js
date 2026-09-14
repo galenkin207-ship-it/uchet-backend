@@ -11,7 +11,8 @@ export const workTypesTreeRouter = Router();
 
 const TREE_COLUMNS = `
   id, name, level, parent_id, unit, price, has_price, gesn_code, catalog_type,
-  is_step_item, step_unit_label, work_composition, labor_hours
+  is_step_item, step_unit_label, step_base_work_type_id, work_composition,
+  labor_hours, variant_label
 `;
 
 // GET /tree?parentId=<id>&type=<строка>
