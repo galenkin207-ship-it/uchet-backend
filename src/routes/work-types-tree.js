@@ -184,6 +184,11 @@ workTypesTreeRouter.get(
       `SELECT wt.id, wt.name, wt.level, wt.parent_id, wt.unit, wt.price, wt.has_price,
               wt.gesn_code, wt.catalog_type, wt.is_step_item, wt.step_unit_label,
               wt.work_composition, wt.labor_hours,
+              EXISTS (
+                SELECT 1 FROM work_types s
+                 WHERE s.step_base_work_type_id = wt.id AND s.is_counter_step = true
+                   AND s.status <> 'archived'
+              ) AS has_counter_steps,
               p1.name AS breadcrumb_1, p2.name AS breadcrumb_2,
               p3.name AS breadcrumb_3, p4.name AS breadcrumb_4
          FROM work_types wt
