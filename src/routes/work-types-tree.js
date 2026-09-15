@@ -80,7 +80,12 @@ workTypesTreeRouter.get(
                      c.level = 5
                      OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = c.id)
                    )
-              ) AS has_children
+              ) AS has_children,
+              EXISTS (
+                SELECT 1 FROM work_types s
+                 WHERE s.step_base_work_type_id = wt.id AND s.is_counter_step = true
+                   AND s.status <> 'archived'
+              ) AS has_counter_steps
          FROM work_types wt
         WHERE ${where} AND wt.status <> 'archived' AND wt.is_step_item = false
           AND (
@@ -89,6 +94,32 @@ workTypesTreeRouter.get(
           )
         ORDER BY wt.sort_order, wt.name`,
       params,
+    );
+
+    res.json({ items: rows });
+  }),
+);
+
+// GET /:baseId/counter-steps
+// Список независимых шаговых модификаторов (is_counter_step=true) для
+// базовой позиции baseId — используется UI счётчика (step-counter): у
+// базового листа своя цена (за "стандартный" объём), у каждого шага —
+// цена за один инкремент своей единицы (step_unit_label).
+workTypesTreeRouter.get(
+  "/:baseId/counter-steps",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const baseId = Number(req.params.baseId);
+    if (!Number.isInteger(baseId)) {
+      return res.status(400).json({ error: "baseId должен быть целым числом" });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT id, gesn_code, step_unit_label, price
+         FROM work_types
+        WHERE step_base_work_type_id = $1 AND is_counter_step = true AND status <> 'archived'
+        ORDER BY sort_order, id`,
+      [baseId],
     );
 
     res.json({ items: rows });
@@ -153,6 +184,11 @@ workTypesTreeRouter.get(
       `SELECT wt.id, wt.name, wt.level, wt.parent_id, wt.unit, wt.price, wt.has_price,
               wt.gesn_code, wt.catalog_type, wt.is_step_item, wt.step_unit_label,
               wt.work_composition, wt.labor_hours,
+              EXISTS (
+                SELECT 1 FROM work_types s
+                 WHERE s.step_base_work_type_id = wt.id AND s.is_counter_step = true
+                   AND s.status <> 'archived'
+              ) AS has_counter_steps,
               p1.name AS breadcrumb_1, p2.name AS breadcrumb_2,
               p3.name AS breadcrumb_3, p4.name AS breadcrumb_4
          FROM work_types wt
