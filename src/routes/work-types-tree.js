@@ -11,7 +11,8 @@ export const workTypesTreeRouter = Router();
 
 const TREE_COLUMNS = `
   id, name, level, parent_id, unit, price, has_price, gesn_code, catalog_type,
-  is_step_item, step_unit_label, work_composition, labor_hours
+  is_step_item, step_unit_label, step_base_work_type_id, work_composition,
+  labor_hours, variant_label
 `;
 
 // GET /tree?parentId=<id>&type=<строка>
@@ -41,14 +42,51 @@ workTypesTreeRouter.get(
       params = [id];
     }
 
+    // is_step_item=true — шаговые/модификаторные строки (напр. "На каждый
+    // 1 мм... добавлять к норме"), не самостоятельная позиция для обычного
+    // каскада — задел под будущий UI счётчика (step-counter), пока не
+    // реализован. Скрываем их из списка узлов.
+    //
+    // Этого недостаточно: родительская группа (level 1-4), у которой ВСЕ
+    // потомки на всех уровнях ниже — шаговые is_step_item=true листья,
+    // сама никогда не была самостоятельной позицией (просто контейнер для
+    // шагового модификатора) и после фильтрации листьев превращается в
+    // "карточку-призрак" — has_children=false, но и цены нет. leaf_ancestors
+    // рекурсивно поднимается от каждого настоящего (не-шагового) листа
+    // уровня 5 вверх по parent_id и собирает всех его предков; ancestors_
+    // with_real_leaf — множество id узлов, у которых есть хотя бы один
+    // настоящий лист где-то в поддереве. Такую группу и в общем списке, и в
+    // подсчёте has_children родителя учитываем наравне с настоящими листьями.
     const { rows } = await pool.query(
-      `SELECT ${TREE_COLUMNS},
+      `WITH RECURSIVE leaf_ancestors AS (
+         SELECT id AS leaf_id, parent_id AS ancestor_id
+           FROM work_types
+          WHERE level = 5 AND is_step_item = false AND status <> 'archived'
+                AND parent_id IS NOT NULL
+         UNION ALL
+         SELECT la.leaf_id, wt2.parent_id AS ancestor_id
+           FROM leaf_ancestors la
+           JOIN work_types wt2 ON wt2.id = la.ancestor_id
+          WHERE wt2.parent_id IS NOT NULL
+       ),
+       ancestors_with_real_leaf AS (
+         SELECT DISTINCT ancestor_id AS id FROM leaf_ancestors
+       )
+       SELECT ${TREE_COLUMNS},
               EXISTS (
                 SELECT 1 FROM work_types c
-                 WHERE c.parent_id = wt.id AND c.status <> 'archived'
+                 WHERE c.parent_id = wt.id AND c.status <> 'archived' AND c.is_step_item = false
+                   AND (
+                     c.level = 5
+                     OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = c.id)
+                   )
               ) AS has_children
          FROM work_types wt
-        WHERE ${where} AND wt.status <> 'archived'
+        WHERE ${where} AND wt.status <> 'archived' AND wt.is_step_item = false
+          AND (
+            wt.level = 5
+            OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = wt.id)
+          )
         ORDER BY wt.sort_order, wt.name`,
       params,
     );
@@ -122,7 +160,7 @@ workTypesTreeRouter.get(
          LEFT JOIN work_types p3 ON p3.id = p4.parent_id
          LEFT JOIN work_types p2 ON p2.id = p3.parent_id
          LEFT JOIN work_types p1 ON p1.id = p2.parent_id
-        WHERE wt.level = 5 AND wt.status <> 'archived' AND ${ilikeClauses}
+        WHERE wt.level = 5 AND wt.status <> 'archived' AND wt.is_step_item = false AND ${ilikeClauses}
         ORDER BY wt.id
         LIMIT 500`,
       params,
