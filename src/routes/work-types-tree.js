@@ -130,7 +130,7 @@ workTypesTreeRouter.get(
          LEFT JOIN work_types p3 ON p3.id = p4.parent_id
          LEFT JOIN work_types p2 ON p2.id = p3.parent_id
          LEFT JOIN work_types p1 ON p1.id = p2.parent_id
-        WHERE wt.level = 5 AND wt.status <> 'archived' AND ${ilikeClauses}
+        WHERE wt.level = 5 AND wt.status <> 'archived' AND wt.is_step_item = false AND ${ilikeClauses}
         ORDER BY wt.id
         LIMIT 500`,
       params,
