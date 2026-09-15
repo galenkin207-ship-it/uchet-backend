@@ -15,6 +15,104 @@ const TREE_COLUMNS = `
   labor_hours, variant_label
 `;
 
+// Тот же паттерн ведущего кода, что и в миграции 023
+// (напр. "01-02-088 " или "15-06-001 " перед текстом таблицы/раздела).
+const CODE_PREFIX_RE = /^\d{2}(-\d{2,3}){1,2}\s+/;
+
+function stripCodePrefix(name) {
+  return String(name ?? "").replace(CODE_PREFIX_RE, "");
+}
+
+function normalizeForCompare(name) {
+  return String(name ?? "").trim().toLowerCase();
+}
+
+// is_step_item=true — шаговые/модификаторные строки (напр. "На каждый
+// 1 мм... добавлять к норме"), не самостоятельная позиция для обычного
+// каскада — задел под будущий UI счётчика (step-counter), пока не
+// реализован. Скрываем их из списка узлов.
+//
+// Этого недостаточно: родительская группа (level 1-4), у которой ВСЕ
+// потомки на всех уровнях ниже — шаговые is_step_item=true листья,
+// сама никогда не была самостоятельной позицией (просто контейнер для
+// шагового модификатора) и после фильтрации листьев превращается в
+// "карточку-призрак" — has_children=false, но и цены нет. leaf_ancestors
+// рекурсивно поднимается от каждого настоящего (не-шагового) листа
+// уровня 5 вверх по parent_id и собирает всех его предков; ancestors_
+// with_real_leaf — множество id узлов, у которых есть хотя бы один
+// настоящий лист где-то в поддереве. Такую группу и в общем списке, и в
+// подсчёте has_children родителя учитываем наравне с настоящими листьями.
+async function fetchChildrenRows(where, params) {
+  const { rows } = await pool.query(
+    `WITH RECURSIVE leaf_ancestors AS (
+       SELECT id AS leaf_id, parent_id AS ancestor_id
+         FROM work_types
+        WHERE level = 5 AND is_step_item = false AND status <> 'archived'
+              AND parent_id IS NOT NULL
+       UNION ALL
+       SELECT la.leaf_id, wt2.parent_id AS ancestor_id
+         FROM leaf_ancestors la
+         JOIN work_types wt2 ON wt2.id = la.ancestor_id
+        WHERE wt2.parent_id IS NOT NULL
+     ),
+     ancestors_with_real_leaf AS (
+       SELECT DISTINCT ancestor_id AS id FROM leaf_ancestors
+     )
+     SELECT ${TREE_COLUMNS},
+            EXISTS (
+              SELECT 1 FROM work_types c
+               WHERE c.parent_id = wt.id AND c.status <> 'archived' AND c.is_step_item = false
+                 AND (
+                   c.level = 5
+                   OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = c.id)
+                 )
+            ) AS has_children,
+            EXISTS (
+              SELECT 1 FROM work_types s
+               WHERE s.step_base_work_type_id = wt.id AND s.is_counter_step = true
+                 AND s.status <> 'archived'
+            ) AS has_counter_steps
+       FROM work_types wt
+      WHERE ${where} AND wt.status <> 'archived' AND wt.is_step_item = false
+        AND (
+          wt.level = 5
+          OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = wt.id)
+        )
+      ORDER BY wt.sort_order, wt.name`,
+    params,
+  );
+  return rows;
+}
+
+// Миграция 023 заполнила ряд групп (level=4) без собственного текста именем
+// их родительской таблицы (level=3, код в начале срезан). В каскаде такая
+// группа — лишний промежуточный клик с текстом, полностью дублирующим текст
+// родителя. Разворачиваем это прозрачно на чтении, без изменения данных:
+// если после trim/lower-case и срезания кода у родителя имя ребёнка с ним
+// совпадает — не отдаём сам этот узел, а подставляем на его место его
+// собственных детей (на том же уровне списка, что и остальные настоящие
+// дети родителя). Правило текстовое, а не по id — сработает для любого
+// уровня, где возникнет такое же дублирование. Листья (level=5) своих детей
+// не имеют, поэтому раскрывать их не пытаемся, и рекурсия по построению
+// конечна — дети развёрнутого узла проверяются на дублирование уже
+// относительно ЕГО собственного (свежесрезанного) имени.
+async function expandDuplicateGroups(parentId, parentNameStripped) {
+  const rows = await fetchChildrenRows("wt.parent_id = $1", [parentId]);
+  if (!parentNameStripped) return rows;
+
+  const parentNorm = normalizeForCompare(parentNameStripped);
+  const result = [];
+  for (const row of rows) {
+    if (row.level !== 5 && normalizeForCompare(row.name) === parentNorm) {
+      const nested = await expandDuplicateGroups(row.id, stripCodePrefix(row.name));
+      result.push(...nested);
+    } else {
+      result.push(row);
+    }
+  }
+  return result;
+}
+
 // GET /tree?parentId=<id>&type=<строка>
 // Без parentId — корневой уровень одного каталога (type обязателен).
 // С parentId — непосредственные дети конкретного узла (каталог уже
@@ -25,78 +123,32 @@ workTypesTreeRouter.get(
   asyncHandler(async (req, res) => {
     const { parentId, type } = req.query;
 
-    let where;
-    let params;
     if (parentId === undefined || parentId === "") {
       if (!type) {
         return res.status(400).json({ error: "Укажите type или parentId" });
       }
-      where = "wt.parent_id IS NULL AND wt.level = 1 AND wt.catalog_type = $1";
-      params = [type];
-    } else {
-      const id = Number(parentId);
-      if (!Number.isInteger(id)) {
-        return res.status(400).json({ error: "parentId должен быть целым числом" });
-      }
-      where = "wt.parent_id = $1";
-      params = [id];
+      // Корневой уровень (каталоги) — родителя для сравнения имён нет.
+      const rows = await fetchChildrenRows(
+        "wt.parent_id IS NULL AND wt.level = 1 AND wt.catalog_type = $1",
+        [type],
+      );
+      return res.json({ items: rows });
     }
 
-    // is_step_item=true — шаговые/модификаторные строки (напр. "На каждый
-    // 1 мм... добавлять к норме"), не самостоятельная позиция для обычного
-    // каскада — задел под будущий UI счётчика (step-counter), пока не
-    // реализован. Скрываем их из списка узлов.
-    //
-    // Этого недостаточно: родительская группа (level 1-4), у которой ВСЕ
-    // потомки на всех уровнях ниже — шаговые is_step_item=true листья,
-    // сама никогда не была самостоятельной позицией (просто контейнер для
-    // шагового модификатора) и после фильтрации листьев превращается в
-    // "карточку-призрак" — has_children=false, но и цены нет. leaf_ancestors
-    // рекурсивно поднимается от каждого настоящего (не-шагового) листа
-    // уровня 5 вверх по parent_id и собирает всех его предков; ancestors_
-    // with_real_leaf — множество id узлов, у которых есть хотя бы один
-    // настоящий лист где-то в поддереве. Такую группу и в общем списке, и в
-    // подсчёте has_children родителя учитываем наравне с настоящими листьями.
-    const { rows } = await pool.query(
-      `WITH RECURSIVE leaf_ancestors AS (
-         SELECT id AS leaf_id, parent_id AS ancestor_id
-           FROM work_types
-          WHERE level = 5 AND is_step_item = false AND status <> 'archived'
-                AND parent_id IS NOT NULL
-         UNION ALL
-         SELECT la.leaf_id, wt2.parent_id AS ancestor_id
-           FROM leaf_ancestors la
-           JOIN work_types wt2 ON wt2.id = la.ancestor_id
-          WHERE wt2.parent_id IS NOT NULL
-       ),
-       ancestors_with_real_leaf AS (
-         SELECT DISTINCT ancestor_id AS id FROM leaf_ancestors
-       )
-       SELECT ${TREE_COLUMNS},
-              EXISTS (
-                SELECT 1 FROM work_types c
-                 WHERE c.parent_id = wt.id AND c.status <> 'archived' AND c.is_step_item = false
-                   AND (
-                     c.level = 5
-                     OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = c.id)
-                   )
-              ) AS has_children,
-              EXISTS (
-                SELECT 1 FROM work_types s
-                 WHERE s.step_base_work_type_id = wt.id AND s.is_counter_step = true
-                   AND s.status <> 'archived'
-              ) AS has_counter_steps
-         FROM work_types wt
-        WHERE ${where} AND wt.status <> 'archived' AND wt.is_step_item = false
-          AND (
-            wt.level = 5
-            OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = wt.id)
-          )
-        ORDER BY wt.sort_order, wt.name`,
-      params,
-    );
+    const id = Number(parentId);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: "parentId должен быть целым числом" });
+    }
 
-    res.json({ items: rows });
+    const { rows: parentRows } = await pool.query(
+      "SELECT name FROM work_types WHERE id = $1",
+      [id],
+    );
+    const parentNameStripped = parentRows[0] ? stripCodePrefix(parentRows[0].name) : null;
+
+    const items = await expandDuplicateGroups(id, parentNameStripped);
+
+    res.json({ items });
   }),
 );
 
@@ -137,6 +189,24 @@ function normalize(text) {
 
 function tokenize(query) {
   return normalize(query).split(/\s+/).filter(Boolean);
+}
+
+// /search возвращает листья напрямую, без промежуточных узлов каскада, так
+// что сама "лишняя карточка" (см. expandDuplicateGroups выше) тут ни при чём —
+// но название дублирующей группы (level=4) всё ещё попадает в breadcrumb как
+// отдельное звено, повторяющее текст таблицы перед ним. Тем же текстовым
+// правилом убираем из хлебных крошек звено, совпадающее (после срезания
+// кода) с предыдущим.
+function dedupeBreadcrumb(parts) {
+  const result = [];
+  for (const part of parts) {
+    const prev = result[result.length - 1];
+    if (prev != null && normalizeForCompare(stripCodePrefix(prev)) === normalizeForCompare(part)) {
+      continue;
+    }
+    result.push(part);
+  }
+  return result;
 }
 
 // Тот же скоринг, что и matchScore(text, query) во фронтовом smart-search:
@@ -213,7 +283,7 @@ workTypesTreeRouter.get(
         } = row;
         return {
           ...item,
-          breadcrumb: [b1, b2, b3, b4].filter((x) => x != null),
+          breadcrumb: dedupeBreadcrumb([b1, b2, b3, b4].filter((x) => x != null)),
           score: matchScore(row.name, tokens),
         };
       })
