@@ -42,14 +42,21 @@ workTypesTreeRouter.get(
       params = [id];
     }
 
+    // is_step_item=true — шаговые/модификаторные строки (напр. "На каждый
+    // 1 мм... добавлять к норме"), не самостоятельная позиция для обычного
+    // каскада — задел под будущий UI счётчика (step-counter), пока не
+    // реализован. Скрываем их и из списка узлов, и из подсчёта
+    // has_children родителя, чтобы карточка родителя с единственным
+    // шаговым ребёнком корректно выглядела как лист, а не как узел с
+    // пустым списком детей.
     const { rows } = await pool.query(
       `SELECT ${TREE_COLUMNS},
               EXISTS (
                 SELECT 1 FROM work_types c
-                 WHERE c.parent_id = wt.id AND c.status <> 'archived'
+                 WHERE c.parent_id = wt.id AND c.status <> 'archived' AND c.is_step_item = false
               ) AS has_children
          FROM work_types wt
-        WHERE ${where} AND wt.status <> 'archived'
+        WHERE ${where} AND wt.status <> 'archived' AND wt.is_step_item = false
         ORDER BY wt.sort_order, wt.name`,
       params,
     );
