@@ -12,7 +12,7 @@ export const workTypesTreeRouter = Router();
 const TREE_COLUMNS = `
   id, name, level, parent_id, unit, price, has_price, gesn_code, catalog_type,
   is_step_item, step_unit_label, step_base_work_type_id, work_composition,
-  labor_hours, variant_label
+  labor_hours, variant_label, source
 `;
 
 // Тот же паттерн ведущего кода, что и в миграции 023
@@ -253,7 +253,7 @@ workTypesTreeRouter.get(
     const { rows } = await pool.query(
       `SELECT wt.id, wt.name, wt.level, wt.parent_id, wt.unit, wt.price, wt.has_price,
               wt.gesn_code, wt.catalog_type, wt.is_step_item, wt.step_unit_label,
-              wt.work_composition, wt.labor_hours,
+              wt.work_composition, wt.labor_hours, wt.source,
               EXISTS (
                 SELECT 1 FROM work_types s
                  WHERE s.step_base_work_type_id = wt.id AND s.is_counter_step = true
