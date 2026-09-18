@@ -149,14 +149,42 @@ async function buildSbornikPlan(client, config, { dryRun }) {
     name: config.level1Name,
   });
 
+  // Идемпотентность — по паре (gesn_code листа, тот же сборник уровня 1),
+  // а НЕ по голому gesn_code: коды ГЭСН уникальны только внутри своей книги.
+  // Баг, найденный на staging: "08-01-001-01" уже существует под ГЭСН08
+  // ("Конструкции из кирпича и блоков") — это СОВСЕМ ДРУГАЯ позиция, чем
+  // "08-01-001-01" из ГЭСНм08 ("Трансформатор трёхфазный..."), но голая
+  // проверка по gesn_code считала её "уже импортированной". Дерево всегда
+  // строится строго level1->2->3->4->5 (см. buildSbornikPlan/оригинальный
+  // import-gesn-catalog.js), поэтому можно однозначно подняться от листа к
+  // его сборнику фиксированным JOIN на 4 уровня вверх.
   const codes = items.map((it) => it["код"]);
-  const { rows: existingRows } = codes.length
-    ? await client.query("SELECT gesn_code FROM work_types WHERE gesn_code = ANY($1)", [codes])
+  const { rows: matchRows } = codes.length
+    ? await client.query(
+        `SELECT leaf.gesn_code, root.id AS root_id, root.gesn_code AS root_gesn_code, root.name AS root_name
+           FROM work_types leaf
+           JOIN work_types g4 ON leaf.parent_id = g4.id
+           JOIN work_types g3 ON g4.parent_id = g3.id
+           JOIN work_types g2 ON g3.parent_id = g2.id
+           JOIN work_types root ON g2.parent_id = root.id
+          WHERE leaf.level = 5 AND leaf.gesn_code = ANY($1)`,
+        [codes],
+      )
     : { rows: [] };
-  const existingCodes = new Set(existingRows.map((r) => r.gesn_code));
+
+  const existingCodes = new Set(); // тот же сборник — настоящий повторный импорт, пропускаем
+  const crossBookConflicts = new Map(); // gesn_code -> { rootName, rootGesnCode } — ЧУЖОЙ сборник
+  for (const row of matchRows) {
+    if (row.root_id === level1Id) {
+      existingCodes.add(row.gesn_code);
+    } else if (!crossBookConflicts.has(row.gesn_code)) {
+      crossBookConflicts.set(row.gesn_code, { rootName: row.root_name, rootGesnCode: row.root_gesn_code });
+    }
+  }
 
   const toInsertLeaves = [];
   const examples = [];
+  const codeConflicts = [];
   let skippedExisting = 0;
   let materialsDropped = 0;
   // Таблицы, где несколько РАЗНЫХ позиций делят одну пустую "группу" — имя
@@ -194,6 +222,23 @@ async function buildSbornikPlan(client, config, { dryRun }) {
       continue;
     }
 
+    // gesn_code имеет ГЛОБАЛЬНЫЙ уникальный индекс (idx_work_types_gesn_code,
+    // миграция 017) — не по (сборник, код). Коды, совпадающие с ЧУЖИМ
+    // сборником, нельзя вставить как есть: Postgres упадёт на уникальном
+    // индексе. Не вставляем такие позиции молча — репортим для ручного
+    // решения (см. JSDoc внизу файла), остальной сборник импортируется как
+    // обычно.
+    if (crossBookConflicts.has(item["код"])) {
+      const conflict = crossBookConflicts.get(item["код"]);
+      codeConflicts.push({
+        code: item["код"],
+        name: item["наименование"],
+        existingRootName: conflict.rootName,
+        existingRootGesnCode: conflict.rootGesnCode,
+      });
+      continue;
+    }
+
     const composition = Array.isArray(item["состав_работ"])
       ? item["состав_работ"].join("\n")
       : item["состав_работ"] || null;
@@ -228,6 +273,7 @@ async function buildSbornikPlan(client, config, { dryRun }) {
     skippedExisting,
     materialsDropped,
     toInsertLeaves,
+    codeConflicts,
     examples,
     created: resolver.created,
     multiItemEmptyGroups,
@@ -237,12 +283,27 @@ async function buildSbornikPlan(client, config, { dryRun }) {
 function printPlanReport(plan) {
   console.log(`\n=== ${plan.gesnCode} (${plan.key}) ===`);
   console.log(`Позиций в файле: ${plan.totalItems}`);
-  console.log(`Уже импортировано ранее (найдено по gesn_code, пропускаем): ${plan.skippedExisting}`);
+  console.log(`Уже импортировано ранее (тот же сборник, найдено по gesn_code, пропускаем): ${plan.skippedExisting}`);
   console.log(`Новых листьев (level=5) к вставке: ${plan.toInsertLeaves.length}`);
   console.log(`Новых узлов level=2 (разделы): ${plan.created[2].length}`);
   console.log(`Новых узлов level=3 (таблицы): ${plan.created[3].length}`);
   console.log(`Новых узлов level=4 (группы): ${plan.created[4].length}`);
   console.log(`Полей "материалы" в файле (НЕ импортируются, колонки нет): ${plan.materialsDropped}`);
+
+  if (plan.codeConflicts.length) {
+    console.log(
+      `\nВНИМАНИЕ: конфликт gesn_code с ДРУГИМ сборником (${plan.codeConflicts.length}) — gesn_code имеет ` +
+        `глобальный уникальный индекс (миграция 017), НЕ вставятся как есть, требуют решения:`,
+    );
+    for (const c of plan.codeConflicts.slice(0, 15)) {
+      console.log(
+        `  ${c.code} "${c.name}" — уже занят сборником ${c.existingRootGesnCode} ("${c.existingRootName}")`,
+      );
+    }
+    if (plan.codeConflicts.length > 15) {
+      console.log(`  ...и ещё ${plan.codeConflicts.length - 15}`);
+    }
+  }
 
   if (plan.multiItemEmptyGroups.length) {
     console.log(
@@ -355,16 +416,19 @@ async function main() {
     await client.query("BEGIN");
     let totalInserted = 0;
     let totalSkipped = 0;
+    let totalConflicts = 0;
     for (const config of configs) {
       const plan = await buildSbornikPlan(client, config, { dryRun: false });
       printPlanReport(plan);
       const inserted = await batchInsertLeaves(client, plan.toInsertLeaves);
       totalInserted += inserted;
       totalSkipped += plan.skippedExisting;
+      totalConflicts += plan.codeConflicts.length;
     }
     console.log(`\n=== Итог ===`);
     console.log(`Вставлено новых листьев: ${totalInserted}`);
-    console.log(`Пропущено как уже импортированные (gesn_code): ${totalSkipped}`);
+    console.log(`Пропущено как уже импортированные (тот же сборник, gesn_code): ${totalSkipped}`);
+    console.log(`НЕ вставлено из-за конфликта gesn_code с другим сборником: ${totalConflicts}`);
     await client.query("COMMIT");
     console.log("COMMIT выполнен.");
   } catch (err) {
@@ -401,9 +465,10 @@ main()
  *   node scripts/import-additional-sborniks.js --dry-run --only=gesn26
  *   node scripts/import-additional-sborniks.js --apply
  *
- * Идемпотентность: --apply безопасно перезапускать — листья (level=5) с уже
- * существующим gesn_code пропускаются (используется уникальный индекс
- * idx_work_types_gesn_code из миграции 017); узлы level=1-4 ищутся по
+ * Идемпотентность: --apply безопасно перезапускать — листья (level=5)
+ * пропускаются, только если совпадающий gesn_code найден ПОД ТЕМ ЖЕ
+ * сборником уровня 1 (не голый gesn_code — коды ГЭСН уникальны только
+ * внутри своей книги, см. пункт 5 ниже); узлы level=1-4 ищутся по
  * (parent_id, level, name) / (level=1, gesn_code) перед созданием.
  *
  * Решения по неоднозначным местам ТЗ (проверить перед --apply на проде):
@@ -445,4 +510,21 @@ main()
  *    (multiItemEmptyGroups) для ручной проверки/переименования после
  *    импорта, аналогично тому, как было с миграциями 021/023 для основного
  *    каталога.
+ *
+ * 5. gesn_code коллизии МЕЖДУ сборниками — найдено на staging: "08-01-001-01"
+ *    уже существует под ГЭСН08 ("Конструкции из кирпича и блоков"), а в
+ *    ГЭСНм08 тот же "код" — это "Трансформатор трёхфазный...", совершенно
+ *    другая позиция. Разные книги (ГЭСН/ГЭСНм) переиспользуют один и тот же
+ *    номер книги (08), и "код" в исходных файлах не несёт признака буквы
+ *    книги. Идемпотентность (см. выше) теперь корректно НЕ считает такие
+ *    коды "уже импортированными" — но у work_types есть ГЛОБАЛЬНЫЙ уникальный
+ *    индекс idx_work_types_gesn_code (миграция 017, НЕ per-сборник), так что
+ *    вставить такую позицию как есть всё равно нельзя — Postgres упадёт на
+ *    уникальном индексе. Скрипт детектирует такие коды заранее (JOIN до
+ *    уровня 1) и НЕ вставляет их — печатает в отчёте (codeConflicts) с
+ *    указанием, каким сборником код уже занят, остальной сборник при этом
+ *    импортируется нормально. Это не решение конфликта, а его локализация —
+ *    сами конфликтующие позиции нужно либо не импортировать вовсе, либо
+ *    обсудить схему (например, менять индекс на составной по фактическому
+ *    сборнику, если для них важно попасть в каталог).
  */
