@@ -4,10 +4,15 @@
 // (source='gesn_catalog', см. import-gesn-catalog.js). По образцу этого
 // скрипта, но:
 //   - флаги --dry-run/--apply (не --dry-run/--force, как в оригинале);
-//   - идемпотентность по gesn_code на уровне листа (level=5): если строка
-//     с таким gesn_code уже есть — пропускаем именно её, остальное дерево
-//     (уровни 1-4) резолвится через getOrCreateContainer по (parent_id,
-//     level, name) — так безопасно перезапускать --apply повторно.
+//   - идемпотентность по (gesn_code листа, тот же сборник уровня 1) — не по
+//     голому gesn_code (уникален только внутри своей книги, см. JSDoc п.5);
+//     совпадение под ЭТИМ ЖЕ сборником не пропускается, а переподвешивается
+//     (обновляются parent_id и содержательные поля, id не трогается — см.
+//     JSDoc п.6, случай частичного среза ГЭСНм08 id=980);
+//   - уровни 1-4 резолвятся через getOrCreateContainer/getOrCreateLevel1 по
+//     (parent_id, level, name) / (level=1, gesn_code) — так безопасно
+//     перезапускать --apply повторно; существующий level=1 переименовывается
+//     в полное официальное название, если отличается.
 //
 // Формат входных файлов и обоснование решений по неоднозначным местам —
 // см. JSDoc внизу файла.
@@ -54,6 +59,7 @@ function createResolver(client, { dryRun }) {
   const sortCounters = new Map(); // parentId (или "level1") -> следующий sort_order
   let nextFakeId = -1;
   const created = { 1: [], 2: [], 3: [], 4: [] };
+  const renames = []; // { id, oldName, newName } — существующий level=1 переименован под официальное название
 
   async function nextSortOrder(scopeKey, whereSql, whereParams) {
     if (!sortCounters.has(scopeKey)) {
@@ -73,12 +79,22 @@ function createResolver(client, { dryRun }) {
     if (containerCache.has(key)) return containerCache.get(key);
 
     const { rows } = await client.query(
-      "SELECT id FROM work_types WHERE level = 1 AND gesn_code = $1",
+      "SELECT id, name FROM work_types WHERE level = 1 AND gesn_code = $1",
       [gesnCode],
     );
     if (rows.length) {
-      containerCache.set(key, rows[0].id);
-      return rows[0].id;
+      const existing = rows[0];
+      containerCache.set(key, existing.id);
+      // Может уже существовать как частичный срез той же официальной книги
+      // (см. JSDoc, пункт 6) — переименовываем в полное официальное
+      // название, id и остальные узлы не трогаем.
+      if (existing.name !== name) {
+        renames.push({ id: existing.id, oldName: existing.name, newName: name });
+        if (!dryRun) {
+          await client.query("UPDATE work_types SET name = $1 WHERE id = $2", [name, existing.id]);
+        }
+      }
+      return existing.id;
     }
 
     if (dryRun) {
@@ -134,7 +150,7 @@ function createResolver(client, { dryRun }) {
     return inserted[0].id;
   }
 
-  return { getOrCreateLevel1, getOrCreateContainer, created };
+  return { getOrCreateLevel1, getOrCreateContainer, created, renames };
 }
 
 // Строит план для одного сборника: резолвит/создаёт уровни 1-4, собирает
@@ -154,38 +170,49 @@ async function buildSbornikPlan(client, config, { dryRun }) {
   // Баг, найденный на staging: "08-01-001-01" уже существует под ГЭСН08
   // ("Конструкции из кирпича и блоков") — это СОВСЕМ ДРУГАЯ позиция, чем
   // "08-01-001-01" из ГЭСНм08 ("Трансформатор трёхфазный..."), но голая
-  // проверка по gesn_code считала её "уже импортированной". Дерево всегда
-  // строится строго level1->2->3->4->5 (см. buildSbornikPlan/оригинальный
-  // import-gesn-catalog.js), поэтому можно однозначно подняться от листа к
-  // его сборнику фиксированным JOIN на 4 уровня вверх.
+  // проверка по gesn_code считала её "уже импортированной".
+  //
+  // Подняться от листа к его сборнику НЕЛЬЗЯ фиксированным JOIN на 4 уровня
+  // вверх: часть уже существующих листьев (см. JSDoc, пункт 6 — частичный
+  // срез ГЭСНм08, id=980) висит ПЛОСКО прямо под level=2, без level=3/4.
+  // Поэтому поднимаемся рекурсивным CTE по parent_id до узла без родителя
+  // (level=1) — работает для любой глубины.
   const codes = items.map((it) => it["код"]);
   const { rows: matchRows } = codes.length
     ? await client.query(
-        `SELECT leaf.gesn_code, root.id AS root_id, root.gesn_code AS root_gesn_code, root.name AS root_name
-           FROM work_types leaf
-           JOIN work_types g4 ON leaf.parent_id = g4.id
-           JOIN work_types g3 ON g4.parent_id = g3.id
-           JOIN work_types g2 ON g3.parent_id = g2.id
-           JOIN work_types root ON g2.parent_id = root.id
-          WHERE leaf.level = 5 AND leaf.gesn_code = ANY($1)`,
+        `WITH RECURSIVE ancestry AS (
+           SELECT w.id AS leaf_id, w.parent_id AS leaf_parent_id, w.gesn_code,
+                  w.id AS cur_id, w.parent_id AS cur_parent_id
+             FROM work_types w
+            WHERE w.level = 5 AND w.gesn_code = ANY($1)
+           UNION ALL
+           SELECT a.leaf_id, a.leaf_parent_id, a.gesn_code, p.id AS cur_id, p.parent_id AS cur_parent_id
+             FROM ancestry a
+             JOIN work_types p ON p.id = a.cur_parent_id
+         )
+         SELECT a.leaf_id, a.leaf_parent_id, a.gesn_code,
+                a.cur_id AS root_id, root.gesn_code AS root_gesn_code, root.name AS root_name
+           FROM ancestry a
+           JOIN work_types root ON root.id = a.cur_id
+          WHERE a.cur_parent_id IS NULL`,
         [codes],
       )
     : { rows: [] };
 
-  const existingCodes = new Set(); // тот же сборник — настоящий повторный импорт, пропускаем
+  const ownBookMatches = new Map(); // gesn_code -> { leafId, leafParentId } — тот же сборник, переподвешиваем
   const crossBookConflicts = new Map(); // gesn_code -> { rootName, rootGesnCode } — ЧУЖОЙ сборник
   for (const row of matchRows) {
     if (row.root_id === level1Id) {
-      existingCodes.add(row.gesn_code);
+      ownBookMatches.set(row.gesn_code, { leafId: row.leaf_id, leafParentId: row.leaf_parent_id });
     } else if (!crossBookConflicts.has(row.gesn_code)) {
       crossBookConflicts.set(row.gesn_code, { rootName: row.root_name, rootGesnCode: row.root_gesn_code });
     }
   }
 
   const toInsertLeaves = [];
+  const relinks = []; // существующие листья того же сборника — обновляем parent_id + поля, id не трогаем
   const examples = [];
   const codeConflicts = [];
-  let skippedExisting = 0;
   let materialsDropped = 0;
   // Таблицы, где несколько РАЗНЫХ позиций делят одну пустую "группу" — имя
   // такой группы берётся от первой встреченной позиции (см. JSDoc внизу
@@ -217,11 +244,6 @@ async function buildSbornikPlan(client, config, { dryRun }) {
 
     materialsDropped += Array.isArray(item["материалы"]) ? item["материалы"].length : 0;
 
-    if (existingCodes.has(item["код"])) {
-      skippedExisting++;
-      continue;
-    }
-
     // gesn_code имеет ГЛОБАЛЬНЫЙ уникальный индекс (idx_work_types_gesn_code,
     // миграция 017) — не по (сборник, код). Коды, совпадающие с ЧУЖИМ
     // сборником, нельзя вставить как есть: Postgres упадёт на уникальном
@@ -245,6 +267,30 @@ async function buildSbornikPlan(client, config, { dryRun }) {
     const variantLabel = item["вариант"] && item["вариант"].trim() ? item["вариант"] : item["наименование"];
     const price = Number(item["цена"]) || 0;
 
+    // Уже существует под ЭТИМ ЖЕ сборником (найдено рекурсивным подъёмом
+    // выше) — не создаём вторую строку с тем же gesn_code (упадёт на
+    // уникальном индексе), а переподвешиваем существующий лист на
+    // правильное место новой иерархии. id и внешние ссылки (record_items)
+    // не трогаем — обновляем только parent_id и содержательные поля.
+    const ownMatch = ownBookMatches.get(item["код"]);
+    if (ownMatch) {
+      relinks.push({
+        leafId: ownMatch.leafId,
+        oldParentId: ownMatch.leafParentId,
+        newParentId: l4Id,
+        code: item["код"],
+        name: item["наименование"],
+        unit: item["ед_изм"],
+        laborHours: item["трудозатраты_чел_ч"],
+        workComposition: composition,
+        variantLabel,
+        price,
+        hasPrice: price > 0,
+        sortOrder: i,
+      });
+      continue;
+    }
+
     toInsertLeaves.push({
       parentId: l4Id,
       gesnCode: item["код"],
@@ -265,30 +311,84 @@ async function buildSbornikPlan(client, config, { dryRun }) {
 
   const multiItemEmptyGroups = [...emptyGroupTables.values()].filter((g) => g.codes.length > 1);
 
+  // Переподвешивание (см. JSDoc п.6) двигает лист на НОВОЕ parent_id — старый
+  // родитель (в частичном срезе ГЭСНм08 это плоский level=2) может остаться
+  // без единого ребёнка. Это не переносится/не удаляется автоматически
+  // (удаление — отдельное решение), но стоит явно показать в отчёте, чтобы
+  // такие пустые ветки не всплыли в каталоге незамеченными.
+  const oldParentIds = [...new Set(relinks.filter((r) => r.oldParentId !== r.newParentId).map((r) => r.oldParentId))];
+  let orphanedContainers = [];
+  if (oldParentIds.length) {
+    const { rows: childCountRows } = await client.query(
+      "SELECT parent_id, name, level, COUNT(*)::int AS total_children FROM work_types WHERE parent_id = ANY($1) GROUP BY parent_id, name, level",
+      [oldParentIds],
+    );
+    const relinkedAwayCount = new Map();
+    for (const r of relinks) {
+      if (r.oldParentId === r.newParentId) continue;
+      relinkedAwayCount.set(r.oldParentId, (relinkedAwayCount.get(r.oldParentId) || 0) + 1);
+    }
+    orphanedContainers = childCountRows
+      .filter((row) => row.total_children === (relinkedAwayCount.get(row.parent_id) || 0))
+      .map((row) => ({ id: row.parent_id, name: row.name, level: row.level }));
+  }
+
   return {
     key: config.key,
     gesnCode: config.gesnCode,
     level1Id,
     totalItems: items.length,
-    skippedExisting,
     materialsDropped,
     toInsertLeaves,
+    relinks,
     codeConflicts,
     examples,
     created: resolver.created,
+    renames: resolver.renames,
     multiItemEmptyGroups,
+    orphanedContainers,
   };
 }
 
 function printPlanReport(plan) {
   console.log(`\n=== ${plan.gesnCode} (${plan.key}) ===`);
   console.log(`Позиций в файле: ${plan.totalItems}`);
-  console.log(`Уже импортировано ранее (тот же сборник, найдено по gesn_code, пропускаем): ${plan.skippedExisting}`);
+
+  if (plan.renames.length) {
+    for (const r of plan.renames) {
+      console.log(`Переименован существующий сборник level=1 id=${r.id}: "${r.oldName}" -> "${r.newName}"`);
+    }
+  }
+
+  console.log(
+    `Переподвешено (лист уже существовал под этим сборником — было в другом месте дерева, ` +
+      `теперь в правильной иерархии; id и внешние ссылки не менялись): ${plan.relinks.length}`,
+  );
   console.log(`Новых листьев (level=5) к вставке: ${plan.toInsertLeaves.length}`);
   console.log(`Новых узлов level=2 (разделы): ${plan.created[2].length}`);
   console.log(`Новых узлов level=3 (таблицы): ${plan.created[3].length}`);
   console.log(`Новых узлов level=4 (группы): ${plan.created[4].length}`);
   console.log(`Полей "материалы" в файле (НЕ импортируются, колонки нет): ${plan.materialsDropped}`);
+
+  if (plan.relinks.length) {
+    console.log("\nПримеры переподвешенных листьев:");
+    for (const r of plan.relinks.slice(0, 10)) {
+      console.log(`  ${r.code} "${r.name}": parent_id ${r.oldParentId} -> ${r.newParentId} (id листа не менялся: ${r.leafId})`);
+    }
+    if (plan.relinks.length > 10) {
+      console.log(`  ...и ещё ${plan.relinks.length - 10}`);
+    }
+  }
+
+  if (plan.orphanedContainers.length) {
+    console.log(
+      `\nВНИМАНИЕ: узлы, которые после переподвешивания останутся БЕЗ единого ребёнка ` +
+        `(старые контейнеры частичного среза — автоматически не удаляются, решение по ним отдельное):`,
+    );
+    for (const o of plan.orphanedContainers) {
+      console.log(`  level=${o.level} id=${o.id} "${o.name}"`);
+    }
+  }
 
   if (plan.codeConflicts.length) {
     console.log(
@@ -377,6 +477,26 @@ async function batchInsertLeaves(client, leaves, batchSize = 500) {
   return inserted;
 }
 
+// Переподвешивает уже существующие листья (найдены тем же gesn_code под тем
+// же сборником, но в другом месте дерева — см. JSDoc, пункт 6) на новое
+// parent_id и обновляет содержательные поля. id, gesn_code, level,
+// catalog_type, source и is_step_item/is_counter_step/step_* НЕ трогаем —
+// на них могут ссылаться record_items или ручная разметка, сделанная раньше.
+async function applyRelinks(client, relinks) {
+  let updated = 0;
+  for (const r of relinks) {
+    await client.query(
+      `UPDATE work_types
+          SET parent_id = $1, name = $2, unit = $3, price = $4, has_price = $5,
+              labor_hours = $6, work_composition = $7, variant_label = $8, sort_order = $9
+        WHERE id = $10`,
+      [r.newParentId, r.name, r.unit, r.price, r.hasPrice, r.laborHours, r.workComposition, r.variantLabel, r.sortOrder, r.leafId],
+    );
+    updated++;
+  }
+  return updated;
+}
+
 function parseArgs() {
   const rest = process.argv.slice(2);
   const only = rest.find((a) => a.startsWith("--only="))?.slice("--only=".length);
@@ -415,19 +535,20 @@ async function main() {
 
     await client.query("BEGIN");
     let totalInserted = 0;
-    let totalSkipped = 0;
+    let totalRelinked = 0;
     let totalConflicts = 0;
     for (const config of configs) {
       const plan = await buildSbornikPlan(client, config, { dryRun: false });
       printPlanReport(plan);
       const inserted = await batchInsertLeaves(client, plan.toInsertLeaves);
+      const relinked = await applyRelinks(client, plan.relinks);
       totalInserted += inserted;
-      totalSkipped += plan.skippedExisting;
+      totalRelinked += relinked;
       totalConflicts += plan.codeConflicts.length;
     }
     console.log(`\n=== Итог ===`);
     console.log(`Вставлено новых листьев: ${totalInserted}`);
-    console.log(`Пропущено как уже импортированные (тот же сборник, gesn_code): ${totalSkipped}`);
+    console.log(`Переподвешено существующих листьев (тот же сборник, новое parent_id): ${totalRelinked}`);
     console.log(`НЕ вставлено из-за конфликта gesn_code с другим сборником: ${totalConflicts}`);
     await client.query("COMMIT");
     console.log("COMMIT выполнен.");
@@ -465,11 +586,13 @@ main()
  *   node scripts/import-additional-sborniks.js --dry-run --only=gesn26
  *   node scripts/import-additional-sborniks.js --apply
  *
- * Идемпотентность: --apply безопасно перезапускать — листья (level=5)
- * пропускаются, только если совпадающий gesn_code найден ПОД ТЕМ ЖЕ
- * сборником уровня 1 (не голый gesn_code — коды ГЭСН уникальны только
- * внутри своей книги, см. пункт 5 ниже); узлы level=1-4 ищутся по
- * (parent_id, level, name) / (level=1, gesn_code) перед созданием.
+ * Идемпотентность: --apply безопасно перезапускать. Совпадающий gesn_code
+ * ПОД ТЕМ ЖЕ сборником уровня 1 (не голый gesn_code — коды ГЭСН уникальны
+ * только внутри своей книги, см. пункт 5 ниже) не создаёт вторую строку, а
+ * переподвешивает существующий лист (обновляет parent_id и содержательные
+ * поля, id не трогает — см. пункт 6); узлы level=1-4 ищутся по (parent_id,
+ * level, name) / (level=1, gesn_code) перед созданием, существующий level=1
+ * при необходимости переименовывается в актуальное официальное название.
  *
  * Решения по неоднозначным местам ТЗ (проверить перед --apply на проде):
  *
@@ -527,4 +650,28 @@ main()
  *    сами конфликтующие позиции нужно либо не импортировать вовсе, либо
  *    обсудить схему (например, менять индекс на составной по фактическому
  *    сборнику, если для них важно попасть в каталог).
+ *
+ * 6. ГЭСНм08 частично уже существовал в базе (найдено на staging): level=1
+ *    id=980, gesn_code='ГЭСНм08', до фикса называвшийся "Электротехнические
+ *    установки (жилой срез)" — срез той же официальной книги на 290 листьев
+ *    (только разделы 2.6/2.8/3.5 из более раннего импорта), с ПЛОСКОЙ
+ *    структурой: листья висели прямо под level=2, без level=3 (таблица) и
+ *    level=4 (группа). 1 запись в record_items ссылается на один из этих
+ *    290 work_type_id — физически пересоздавать их id нельзя.
+ *    Скрипт для этого id: (а) переименовывает его в актуальное название
+ *    SBORNIKI[].level1Name, id не трогая; (б) для каждого листа файла,
+ *    который уже существует под этим сборником (найдено рекурсивным
+ *    подъёмом по parent_id — не фиксированным JOIN, т.к. глубина у старых
+ *    записей другая), ОБНОВЛЯЕТ parent_id на правильный узел level=4 новой
+ *    иерархии и обновляет содержательные поля (name/unit/price/has_price/
+ *    labor_hours/work_composition/variant_label/sort_order), id и все
+ *    остальные колонки (в т.ч. is_step_item/is_counter_step/step_*) не
+ *    трогает. Такие случаи попадают в отчёт как "переподвешено", а не как
+ *    "уже импортировано, пропускаем" — это осмысленное изменение дерева, а
+ *    не no-op.
+ *    Побочный эффект: старые плоские level=2 контейнеры частичного среза
+ *    могут остаться без единого ребёнка, если новая иерархия для этих же
+ *    позиций строит level=2/3/4 под другими именами. Скрипт их НЕ удаляет
+ *    (удаление — отдельное решение), но печатает в отчёте (orphanedContainers)
+ *    для ручной проверки.
  */
