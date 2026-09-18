@@ -14,6 +14,12 @@
 //     перезапускать --apply повторно; существующий level=1 переименовывается
 //     в полное официальное название, если отличается.
 //
+// Требует миграцию 025 (sbornik_id + составной уникальный индекс
+// (sbornik_id, gesn_code) вместо глобального) — каждая вставленная/
+// переподвешенная строка получает sbornik_id = id её level=1. Без миграции
+// 025 совпадение gesn_code с ДРУГИМ сборником (см. JSDoc п.5) упадёт на
+// старом глобальном уникальном индексе.
+//
 // Формат входных файлов и обоснование решений по неоднозначным местам —
 // см. JSDoc внизу файла.
 import "dotenv/config";
@@ -112,12 +118,16 @@ function createResolver(client, { dryRun }) {
        RETURNING id`,
       [name, CATALOG_TYPE, gesnCode, sortOrder],
     );
-    containerCache.set(key, inserted[0].id);
+    const newId = inserted[0].id;
+    // sbornik_id для level=1 — собственный id (миграция 025); недоступен на
+    // момент INSERT (id даёт только сама вставка) — отдельный UPDATE сразу после.
+    await client.query("UPDATE work_types SET sbornik_id = $1 WHERE id = $1", [newId]);
+    containerCache.set(key, newId);
     created[1].push({ name, gesnCode });
-    return inserted[0].id;
+    return newId;
   }
 
-  async function getOrCreateContainer({ parentId, level, name }) {
+  async function getOrCreateContainer({ parentId, level, name, sbornikId }) {
     const key = `${parentId}|${level}|${name}`;
     if (containerCache.has(key)) return containerCache.get(key);
 
@@ -140,10 +150,10 @@ function createResolver(client, { dryRun }) {
     const sortOrder = await nextSortOrder(parentId, "parent_id = $1", [parentId]);
     const { rows: inserted } = await client.query(
       `INSERT INTO work_types
-         (name, unit, price, level, parent_id, catalog_type, source, sort_order, has_price)
-       VALUES ($1,'-',0,$2,$3,$4,'gesn_catalog',$5,false)
+         (name, unit, price, level, parent_id, catalog_type, source, sort_order, has_price, sbornik_id)
+       VALUES ($1,'-',0,$2,$3,$4,'gesn_catalog',$5,false,$6)
        RETURNING id`,
-      [name, level, parentId, CATALOG_TYPE, sortOrder],
+      [name, level, parentId, CATALOG_TYPE, sortOrder, sbornikId],
     );
     containerCache.set(key, inserted[0].id);
     created[level].push({ name, parentId });
@@ -166,11 +176,11 @@ async function buildSbornikPlan(client, config, { dryRun }) {
   });
 
   // Идемпотентность — по паре (gesn_code листа, тот же сборник уровня 1),
-  // а НЕ по голому gesn_code: коды ГЭСН уникальны только внутри своей книги.
-  // Баг, найденный на staging: "08-01-001-01" уже существует под ГЭСН08
-  // ("Конструкции из кирпича и блоков") — это СОВСЕМ ДРУГАЯ позиция, чем
-  // "08-01-001-01" из ГЭСНм08 ("Трансформатор трёхфазный..."), но голая
-  // проверка по gesn_code считала её "уже импортированной".
+  // а НЕ по голому gesn_code: коды ГЭСН уникальны только внутри своей книги
+  // (см. миграция 025 — уникальный индекс теперь (sbornik_id, gesn_code),
+  // раньше был глобальным, см. JSDoc п.5). Совпадение gesn_code под ЧУЖИМ
+  // сборником больше не проблема для вставки — фильтруем прямо в SQL,
+  // оставляя только совпадения под НАШИМ level1Id (кандидаты на переподвес).
   //
   // Подняться от листа к его сборнику НЕЛЬЗЯ фиксированным JOIN на 4 уровня
   // вверх: часть уже существующих листьев (см. JSDoc, пункт 6 — частичный
@@ -190,29 +200,21 @@ async function buildSbornikPlan(client, config, { dryRun }) {
              FROM ancestry a
              JOIN work_types p ON p.id = a.cur_parent_id
          )
-         SELECT a.leaf_id, a.leaf_parent_id, a.gesn_code,
-                a.cur_id AS root_id, root.gesn_code AS root_gesn_code, root.name AS root_name
-           FROM ancestry a
-           JOIN work_types root ON root.id = a.cur_id
-          WHERE a.cur_parent_id IS NULL`,
-        [codes],
+         SELECT leaf_id, leaf_parent_id, gesn_code
+           FROM ancestry
+          WHERE cur_parent_id IS NULL AND cur_id = $2`,
+        [codes, level1Id],
       )
     : { rows: [] };
 
   const ownBookMatches = new Map(); // gesn_code -> { leafId, leafParentId } — тот же сборник, переподвешиваем
-  const crossBookConflicts = new Map(); // gesn_code -> { rootName, rootGesnCode } — ЧУЖОЙ сборник
   for (const row of matchRows) {
-    if (row.root_id === level1Id) {
-      ownBookMatches.set(row.gesn_code, { leafId: row.leaf_id, leafParentId: row.leaf_parent_id });
-    } else if (!crossBookConflicts.has(row.gesn_code)) {
-      crossBookConflicts.set(row.gesn_code, { rootName: row.root_name, rootGesnCode: row.root_gesn_code });
-    }
+    ownBookMatches.set(row.gesn_code, { leafId: row.leaf_id, leafParentId: row.leaf_parent_id });
   }
 
   const toInsertLeaves = [];
   const relinks = []; // существующие листья того же сборника — обновляем parent_id + поля, id не трогаем
   const examples = [];
-  const codeConflicts = [];
   let materialsDropped = 0;
   // Таблицы, где несколько РАЗНЫХ позиций делят одну пустую "группу" — имя
   // такой группы берётся от первой встреченной позиции (см. JSDoc внизу
@@ -224,15 +226,15 @@ async function buildSbornikPlan(client, config, { dryRun }) {
     const item = items[i];
 
     const l2Name = config.level2Name(item);
-    const l2Id = await resolver.getOrCreateContainer({ parentId: level1Id, level: 2, name: l2Name });
+    const l2Id = await resolver.getOrCreateContainer({ parentId: level1Id, level: 2, name: l2Name, sbornikId: level1Id });
 
     const l3Name = item["таблица"];
-    const l3Id = await resolver.getOrCreateContainer({ parentId: l2Id, level: 3, name: l3Name });
+    const l3Id = await resolver.getOrCreateContainer({ parentId: l2Id, level: 3, name: l3Name, sbornikId: level1Id });
 
     const rawGroup = item["группа"] || "";
     const isEmptyGroup = !rawGroup.trim();
     const l4Name = isEmptyGroup ? item["вариант"] || item["наименование"] : rawGroup;
-    const l4Id = await resolver.getOrCreateContainer({ parentId: l3Id, level: 4, name: l4Name });
+    const l4Id = await resolver.getOrCreateContainer({ parentId: l3Id, level: 4, name: l4Name, sbornikId: level1Id });
 
     if (isEmptyGroup) {
       const l3Key = `${l2Id}|${l3Name}`;
@@ -244,23 +246,6 @@ async function buildSbornikPlan(client, config, { dryRun }) {
 
     materialsDropped += Array.isArray(item["материалы"]) ? item["материалы"].length : 0;
 
-    // gesn_code имеет ГЛОБАЛЬНЫЙ уникальный индекс (idx_work_types_gesn_code,
-    // миграция 017) — не по (сборник, код). Коды, совпадающие с ЧУЖИМ
-    // сборником, нельзя вставить как есть: Postgres упадёт на уникальном
-    // индексе. Не вставляем такие позиции молча — репортим для ручного
-    // решения (см. JSDoc внизу файла), остальной сборник импортируется как
-    // обычно.
-    if (crossBookConflicts.has(item["код"])) {
-      const conflict = crossBookConflicts.get(item["код"]);
-      codeConflicts.push({
-        code: item["код"],
-        name: item["наименование"],
-        existingRootName: conflict.rootName,
-        existingRootGesnCode: conflict.rootGesnCode,
-      });
-      continue;
-    }
-
     const composition = Array.isArray(item["состав_работ"])
       ? item["состав_работ"].join("\n")
       : item["состав_работ"] || null;
@@ -268,16 +253,17 @@ async function buildSbornikPlan(client, config, { dryRun }) {
     const price = Number(item["цена"]) || 0;
 
     // Уже существует под ЭТИМ ЖЕ сборником (найдено рекурсивным подъёмом
-    // выше) — не создаём вторую строку с тем же gesn_code (упадёт на
-    // уникальном индексе), а переподвешиваем существующий лист на
-    // правильное место новой иерархии. id и внешние ссылки (record_items)
-    // не трогаем — обновляем только parent_id и содержательные поля.
+    // выше) — не создаём вторую строку с тем же gesn_code, а переподвешиваем
+    // существующий лист на правильное место новой иерархии. id и внешние
+    // ссылки (record_items) не трогаем — обновляем только parent_id и
+    // содержательные поля.
     const ownMatch = ownBookMatches.get(item["код"]);
     if (ownMatch) {
       relinks.push({
         leafId: ownMatch.leafId,
         oldParentId: ownMatch.leafParentId,
         newParentId: l4Id,
+        sbornikId: level1Id,
         code: item["код"],
         name: item["наименование"],
         unit: item["ед_изм"],
@@ -293,6 +279,7 @@ async function buildSbornikPlan(client, config, { dryRun }) {
 
     toInsertLeaves.push({
       parentId: l4Id,
+      sbornikId: level1Id,
       gesnCode: item["код"],
       name: item["наименование"],
       unit: item["ед_изм"],
@@ -341,7 +328,6 @@ async function buildSbornikPlan(client, config, { dryRun }) {
     materialsDropped,
     toInsertLeaves,
     relinks,
-    codeConflicts,
     examples,
     created: resolver.created,
     renames: resolver.renames,
@@ -390,21 +376,6 @@ function printPlanReport(plan) {
     }
   }
 
-  if (plan.codeConflicts.length) {
-    console.log(
-      `\nВНИМАНИЕ: конфликт gesn_code с ДРУГИМ сборником (${plan.codeConflicts.length}) — gesn_code имеет ` +
-        `глобальный уникальный индекс (миграция 017), НЕ вставятся как есть, требуют решения:`,
-    );
-    for (const c of plan.codeConflicts.slice(0, 15)) {
-      console.log(
-        `  ${c.code} "${c.name}" — уже занят сборником ${c.existingRootGesnCode} ("${c.existingRootName}")`,
-      );
-    }
-    if (plan.codeConflicts.length > 15) {
-      console.log(`  ...и ещё ${plan.codeConflicts.length - 15}`);
-    }
-  }
-
   if (plan.multiItemEmptyGroups.length) {
     console.log(
       `\nТаблицы, где несколько разных позиций делят одну пустую "группу" (имя группы = наименование ` +
@@ -440,6 +411,7 @@ async function batchInsertLeaves(client, leaves, batchSize = 500) {
     "source",
     "has_price",
     "variant_label",
+    "sbornik_id",
   ];
   let inserted = 0;
   for (let offset = 0; offset < leaves.length; offset += batchSize) {
@@ -465,6 +437,7 @@ async function batchInsertLeaves(client, leaves, batchSize = 500) {
         "gesn_catalog",
         leaf.hasPrice,
         leaf.variantLabel,
+        leaf.sbornikId,
       ];
       const placeholders = columns.map((_, colIdx) => `$${i * columns.length + colIdx + 1}`);
       valuesSql.push(`(${placeholders.join(",")})`);
@@ -488,9 +461,22 @@ async function applyRelinks(client, relinks) {
     await client.query(
       `UPDATE work_types
           SET parent_id = $1, name = $2, unit = $3, price = $4, has_price = $5,
-              labor_hours = $6, work_composition = $7, variant_label = $8, sort_order = $9
-        WHERE id = $10`,
-      [r.newParentId, r.name, r.unit, r.price, r.hasPrice, r.laborHours, r.workComposition, r.variantLabel, r.sortOrder, r.leafId],
+              labor_hours = $6, work_composition = $7, variant_label = $8, sort_order = $9,
+              sbornik_id = $10
+        WHERE id = $11`,
+      [
+        r.newParentId,
+        r.name,
+        r.unit,
+        r.price,
+        r.hasPrice,
+        r.laborHours,
+        r.workComposition,
+        r.variantLabel,
+        r.sortOrder,
+        r.sbornikId,
+        r.leafId,
+      ],
     );
     updated++;
   }
@@ -536,7 +522,6 @@ async function main() {
     await client.query("BEGIN");
     let totalInserted = 0;
     let totalRelinked = 0;
-    let totalConflicts = 0;
     for (const config of configs) {
       const plan = await buildSbornikPlan(client, config, { dryRun: false });
       printPlanReport(plan);
@@ -544,12 +529,10 @@ async function main() {
       const relinked = await applyRelinks(client, plan.relinks);
       totalInserted += inserted;
       totalRelinked += relinked;
-      totalConflicts += plan.codeConflicts.length;
     }
     console.log(`\n=== Итог ===`);
     console.log(`Вставлено новых листьев: ${totalInserted}`);
     console.log(`Переподвешено существующих листьев (тот же сборник, новое parent_id): ${totalRelinked}`);
-    console.log(`НЕ вставлено из-за конфликта gesn_code с другим сборником: ${totalConflicts}`);
     await client.query("COMMIT");
     console.log("COMMIT выполнен.");
   } catch (err) {
@@ -634,22 +617,22 @@ main()
  *    импорта, аналогично тому, как было с миграциями 021/023 для основного
  *    каталога.
  *
- * 5. gesn_code коллизии МЕЖДУ сборниками — найдено на staging: "08-01-001-01"
- *    уже существует под ГЭСН08 ("Конструкции из кирпича и блоков"), а в
- *    ГЭСНм08 тот же "код" — это "Трансформатор трёхфазный...", совершенно
- *    другая позиция. Разные книги (ГЭСН/ГЭСНм) переиспользуют один и тот же
- *    номер книги (08), и "код" в исходных файлах не несёт признака буквы
- *    книги. Идемпотентность (см. выше) теперь корректно НЕ считает такие
- *    коды "уже импортированными" — но у work_types есть ГЛОБАЛЬНЫЙ уникальный
- *    индекс idx_work_types_gesn_code (миграция 017, НЕ per-сборник), так что
- *    вставить такую позицию как есть всё равно нельзя — Postgres упадёт на
- *    уникальном индексе. Скрипт детектирует такие коды заранее (JOIN до
- *    уровня 1) и НЕ вставляет их — печатает в отчёте (codeConflicts) с
- *    указанием, каким сборником код уже занят, остальной сборник при этом
- *    импортируется нормально. Это не решение конфликта, а его локализация —
- *    сами конфликтующие позиции нужно либо не импортировать вовсе, либо
- *    обсудить схему (например, менять индекс на составной по фактическому
- *    сборнику, если для них важно попасть в каталог).
+ * 5. gesn_code коллизии МЕЖДУ сборниками (ИСТОРИЯ, решено миграцией 025) —
+ *    найдено на staging: "08-01-001-01" уже существует под ГЭСН08
+ *    ("Конструкции из кирпича и блоков"), а в ГЭСНм08 тот же "код" — это
+ *    "Трансформатор трёхфазный...", совершенно другая позиция. Разные книги
+ *    (ГЭСН/ГЭСНм) переиспользуют один и тот же номер книги (08), и "код" в
+ *    исходных файлах не несёт признака буквы книги. work_types раньше имел
+ *    ГЛОБАЛЬНЫЙ уникальный индекс на gesn_code (idx_work_types_gesn_code,
+ *    миграция 017) — такие коды физически нельзя было вставить, скрипт их
+ *    детектировал и пропускал (codeConflicts) как отдельную категорию.
+ *    Миграция 025 добавила sbornik_id и заменила индекс на составной
+ *    UNIQUE (sbornik_id, gesn_code) WHERE gesn_code IS NOT NULL — коды
+ *    теперь уникальны только внутри своей книги, как и должно быть по
+ *    правилам ГЭСН. codeConflicts/crossBookConflicts убраны из скрипта:
+ *    межкнижное совпадение gesn_code для вставки нового листа больше не
+ *    проблема вообще — единственная причина не вставлять лист как новый —
+ *    это совпадение gesn_code ПОД ЭТИМ ЖЕ сборником (см. пункт 6, релинк).
  *
  * 6. ГЭСНм08 частично уже существовал в базе (найдено на staging): level=1
  *    id=980, gesn_code='ГЭСНм08', до фикса называвшийся "Электротехнические

@@ -592,6 +592,11 @@ export async function upsertWorkTypeByName({ name, unit, price, actorUserId, act
     }
   }
 
+  // sbornik_id (миграция 025) намеренно не проставляется: эта строка не
+  // parent_id-привязана ни к какому дереву (parent_id остаётся NULL,
+  // level — дефолтный 5) и gesn_code у неё никогда не бывает — вне уникального
+  // индекса (sbornik_id, gesn_code) WHERE gesn_code IS NOT NULL, сборника
+  // резолвить не из чего.
   const { rows } = await pool.query(
     `INSERT INTO work_types (name, unit, price) VALUES ($1,$2,$3) RETURNING id, name, unit, price`,
     [trimmedName, unit, price],
