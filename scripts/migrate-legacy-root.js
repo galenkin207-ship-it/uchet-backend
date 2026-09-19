@@ -15,20 +15,45 @@
 //   - старая (legacy) строка резолвится в момент --apply заново по её
 //     old_n (см. ниже) — запасной ключ: name+unit (без учёта регистра/
 //     пробелов), только когда old_n отсутствует;
-//   - копия резолвится по её legacy_num (миграция 024, уникален в паре
-//     с source='user_added' на практике — если это не так, скрипт упадёт на
-//     дубликате при резолве, см. resolveCopyByLegacyNum).
+//   - копия резолвится по её legacy_num (миграция 024).
 // Оба ключа стабильны между окружениями (в отличие от id), поэтому план,
 // сформированный на staging, в принципе применим и на проде — план просто
-// нужно СГЕНЕРИРОВАТЬ ЗАНОВО (--dry-run) на целевом окружении: набор
-// legacy/copy строк и их old_n/legacy_num там свои.
+// нужно СГЕНЕРИРОВАТЬ ЗАНОВО (--dry-run) на целевом окружении.
 //
 // old_n — колонка из старого Flask-приложения (UNIQUE), для строк,
 // перенесённых при миграции на текущий бэкенд. Ни один файл в migrations/
 // её не создаёт — предположительно часть базовой схемы до появления
 // schema_migrations (миграция 001). Скрипт проверяет её наличие через
 // information_schema перед началом работы и падает с понятным сообщением,
-// если её вдруг нет — вместо непонятной ошибки Postgres на первом запросе.
+// если её вдруг нет.
+//
+// Близнецы-копии (twins): если у legacy-строки при автосопоставлении
+// (тиры K/T1-T4) оказалось НЕСКОЛЬКО кандидатов, но все они с одинаковыми
+// нормализованными name/unit/price И одинаковым parent_id — это не
+// настоящая неоднозначность, а дублирующиеся строки копии (одна и та же
+// позиция завелась в БД несколько раз). action=move_and_archive_twins:
+// слот — копия с минимальным id, остальные архивируются, их record_items
+// тоже перепривязываются на перенесённую строку.
+//
+// Поправки (scripts/data/legacy_overrides.json, { rows: [...] }) — два вида
+// строк, различаются наличием поля action:
+//   - С action (match_copy/place_next_to/archive/delete_if_unreferenced) —
+//     ПОЛНОСТЬЮ заменяют автосопоставление для этой legacy-строки: строка
+//     вынимается из обычного пайплайна (T1-T5/дубли/tier K) ДО его запуска.
+//     Адресация строки — old_n, либо (если old_n нет) точное совпадение
+//     name. Адресация копии (для match_copy/place_next_to) — ТОЛЬКО по
+//     имени (copy_name, нормализованное совпадение среди активных
+//     source='user_added') — не по id (id разный на staging/проде); если
+//     совпадений 0 или больше 1 — строка помечается override_unresolved со
+//     списком всех найденных вариантов, скрипт не гадает и не падает
+//     целиком.
+//   - Без action, только { old_n, set_unit?, set_price? } — НЕ меняют, к
+//     какой копии привязывается строка: это правка поверх результата
+//     ОБЫЧНОГО автосопоставления (ожидается action=move/match_copy/
+//     move_and_archive_twins) — применяется ПОСЛЕ основного пайплайна,
+//     просто подставляет свои unit/price в уже готовую move-строку. Если
+//     строка с этим old_n не свелась к move-семейству (конфликт/подсказка/
+//     ручная) — поправка НЕ применяется, это явно видно в отчёте.
 import "dotenv/config";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -36,19 +61,19 @@ import { pool } from "../src/db.js";
 
 const PLAN_CSV_PATH = "/tmp/legacy_plan.csv";
 const PLAN_JSON_PATH = "/tmp/legacy_plan.json";
+const OVERRIDES_FILE = fileURLToPath(new URL("./data/legacy_overrides.json", import.meta.url));
 
 // Порог для гипотезы "old_n старой строки равен legacy_num её копии"
-// (см. testTierKHypothesis). На staging (2-й раунд диагностики) гипотеза НЕ
-// подтвердилась (совпало 8 из 773) — с 90%-порогом tier K там будет
-// автоматически отключён. Порог, а не жёстко "выключено", — чтобы скрипт
-// остался рабочим, если на другом окружении (или после исправления данных)
-// ключ вдруг всё-таки совпадёт почти всегда.
+// (см. testTierKHypothesis). На staging гипотеза НЕ подтвердилась (8 из
+// 773) — с 90%-порогом tier K там автоматически отключён. Порог, а не
+// жёстко "выключено", — чтобы скрипт остался рабочим, если на другом
+// окружении (или после исправления данных) ключ вдруг совпадёт почти всегда.
 const TIER_K_THRESHOLD = 0.9;
 
 // Синонимы единиц измерения — нижний регистр, без точек/пробелов (сначала
-// applyUnitStrip, потом поиск в этой таблице). Список собран по частым
-// вариантам написания в конструкторских сметах; для единиц вне списка
-// используется просто lower+strip без канонизации (см. normalizeUnit).
+// stripUnit, потом поиск в этой таблице). Список собран по частым вариантам
+// написания в конструкторских сметах; для единиц вне списка используется
+// просто lower+strip без канонизации (см. normalizeUnit).
 const UNIT_SYNONYMS = new Map([
   ["м2", "м2"], ["м²", "м2"], ["квм", "м2"], ["кв2м", "м2"],
   ["мп", "мп"], ["погм", "мп"], ["пм", "мп"], ["м/п", "мп"],
@@ -95,6 +120,21 @@ function pricesEqual(a, b) {
   return Math.abs(Number(a) - Number(b)) < 0.005;
 }
 
+// Близнецы: несколько кандидатов-копий, но все с одинаковыми
+// нормализованными name/unit/price И одинаковым parent_id — не настоящая
+// неоднозначность, а дублирующиеся строки одной и той же позиции.
+function areTwins(candidates) {
+  if (candidates.length < 2) return false;
+  const first = candidates[0];
+  return candidates.every(
+    (c) =>
+      c.nameNorm === first.nameNorm &&
+      c.unitNorm === first.unitNorm &&
+      pricesEqual(c.price, first.price) &&
+      c.parentId === first.parentId,
+  );
+}
+
 function parseArgs() {
   const rest = process.argv.slice(2);
   const getOpt = (name) => {
@@ -105,7 +145,6 @@ function parseArgs() {
     apply: rest.includes("--apply"),
     confirm: rest.includes("--confirm"),
     planPath: getOpt("--plan"),
-    overridesPath: getOpt("--overrides"),
   };
 }
 
@@ -121,9 +160,8 @@ async function assertOldNColumn(client) {
   if (!rows.length) {
     throw new Error(
       "В work_types нет колонки old_n. Скрипт написан в предположении, что она есть " +
-        "(колонка из старого Flask-приложения, УНИКАЛЬНАЯ, использовалась для сопоставления " +
-        "перенесённых строк) — без неё резолв старых строк между окружениями не сработает как задумано. " +
-        "Если колонки действительно нет — сообщите, нужно менять стратегию идентификации.",
+        "(колонка из старого Flask-приложения, УНИКАЛЬНАЯ) — без неё резолв старых строк " +
+        "между окружениями не сработает как задумано.",
     );
   }
 }
@@ -248,8 +286,27 @@ async function loadCopyRows(client) {
   });
 }
 
+// Ссылки на конкретную строку work_types (для delete_if_unreferenced) —
+// record_items.work_type_id, work_types.parent_id, work_types.step_base_work_type_id
+// (единственные FK на work_types(id), см. миграции 009/017 и round-2
+// диагностику legacy_root: requests на work_types вообще не ссылается).
+async function countReferences(client, id) {
+  const { rows } = await client.query(
+    `SELECT
+       (SELECT count(*)::int FROM record_items WHERE work_type_id = $1) AS record_items_count,
+       (SELECT count(*)::int FROM work_types WHERE parent_id = $1) AS children_count,
+       (SELECT count(*)::int FROM work_types WHERE step_base_work_type_id = $1) AS step_base_refs_count`,
+    [id],
+  );
+  return {
+    recordItemsCount: rows[0].record_items_count,
+    childrenCount: rows[0].children_count,
+    stepBaseRefsCount: rows[0].step_base_refs_count,
+  };
+}
+
 // ---------------------------------------------------------------------------
-// Индексы + сопоставление (T1-T5, tier K).
+// Индексы + сопоставление (T1-T5, tier K, близнецы).
 // ---------------------------------------------------------------------------
 
 function buildCopyIndices(copies) {
@@ -272,17 +329,12 @@ function buildCopyIndices(copies) {
 }
 
 // T1-подмножество (имя+ед.+цена точно совпали) — используется и гипотезой
-// tier K, и определением победителя среди дублей имён (п.5 ТЗ).
+// tier K, и определением победителя среди дублей имён (п.5 предыдущего ТЗ).
 function findT1Matches(legacyRow, indices) {
   const nameMatches = indices.byNameNorm.get(legacyRow.nameNorm) ?? [];
   return nameMatches.filter((c) => c.unitNorm === legacyRow.unitNorm && pricesEqual(c.price, legacyRow.price));
 }
 
-// Гипотеза: old_n совпадает с legacy_num КОПИИ среди уже однозначных (1:1)
-// T1-пар. Если совпадает почти всегда (>= TIER_K_THRESHOLD) — old_n можно
-// использовать как основной ключ сопоставления (tier K, проверяется раньше
-// T1); иначе игнорируем гипотезу целиком (примерно так и вышло на staging:
-// 8 из 773, см. заголовок файла).
 function testTierKHypothesis(legacyRows, indices) {
   let pairs = 0;
   let comparable = 0;
@@ -306,7 +358,6 @@ function testTierKHypothesis(legacyRows, indices) {
   };
 }
 
-// Дубли имён среди legacy (п.5 ТЗ): группы строк с одинаковым nameNorm.
 function detectDuplicateGroups(legacyRows) {
   const byName = new Map();
   for (const row of legacyRows) {
@@ -316,14 +367,9 @@ function detectDuplicateGroups(legacyRows) {
   return [...byName.values()].filter((rows) => rows.length > 1);
 }
 
-// Победитель — тот, у кого unit+price совпадают с копией (T1); при равенстве
-// (оба или ни один не имеют T1-совпадения) — больше record_items; при
-// равенстве — меньший id. Проигравшие исключаются из обычного T1-T5
-// сопоставления (не претендуют ни на одну копию) — вместо этого получают
-// action=merge_into_winner.
 function resolveDuplicateWinners(groups, indices) {
   const loserIds = new Set();
-  const winnerOf = new Map(); // loserId -> winner row
+  const winnerOf = new Map();
   const groupInfo = [];
   for (const rows of groups) {
     const scored = rows.map((row) => ({ row, hasT1: findT1Matches(row, indices).length > 0 }));
@@ -361,10 +407,6 @@ function suggestTopMatches(legacyRow, copies, limit = 3) {
   return scored.slice(0, limit);
 }
 
-// Возвращает { tier, candidates } — candidates.length === 1 на тирах
-// K/T1-T4 значит "однозначно, можно строить автоплан" (после глобальной
-// проверки конфликтов, см. resolveConflicts); T5 — только подсказки, никогда
-// не автоплан, даже если кандидат ровно один.
 function matchTiers(legacyRow, indices, copies, tierKEnabled) {
   if (tierKEnabled && legacyRow.oldN != null) {
     const kMatches = indices.byLegacyNum.get(Number(legacyRow.oldN)) ?? [];
@@ -393,8 +435,10 @@ function matchTiers(legacyRow, indices, copies, tierKEnabled) {
 }
 
 // Глобальная проверка конфликтов: одна копия не может достаться двум legacy-
-// строкам. Считаются только тиры K/T1-T4 (T5 никогда не автоплан, поэтому в
-// претензии на копию не участвует).
+// строкам. Тиры K/T1-T4 с несколькими кандидатами сначала проверяются на
+// близнецов (areTwins) — если все кандидаты идентичны по name/unit/price/
+// parent_id, это не конфликт, а move_and_archive_twins. T5 никогда не
+// автоплан, в претензии на копию не участвует.
 function resolveConflicts(matchResults) {
   const claims = new Map(); // copyId -> [legacyId,...]
   for (const m of matchResults) {
@@ -410,24 +454,36 @@ function resolveConflicts(matchResults) {
       if (!m.candidates.length) {
         return { ...m, status: "manual", notes: "нет похожих кандидатов (T5, пересечение токенов = 0)" };
       }
-      const notes = m.suggestions
-        .map((s) => `id=${s.copy.id}(score=${s.score}) ${s.copy.path}`)
-        .join(" | ");
+      const notes = m.suggestions.map((s) => `id=${s.copy.id}(score=${s.score}) ${s.copy.path}`).join(" | ");
       return { ...m, status: "suggestion", notes: `подсказки (не автоплан): ${notes}` };
     }
+
     if (m.candidates.length > 1) {
+      if (areTwins(m.candidates)) {
+        const sorted = [...m.candidates].sort((a, b) => a.id - b.id);
+        const primary = sorted[0];
+        const twins = sorted.slice(1);
+        const contestedByOthers = [primary, ...twins].some((c) => claims.has(c.id));
+        if (!contestedByOthers) {
+          const ids = m.candidates.map((c) => c.id).join(",");
+          return {
+            ...m,
+            status: "move_and_archive_twins",
+            primary,
+            twins,
+            notes: `тир ${m.tier}: ${m.candidates.length} копий-близнецов (copy_id=${ids}), слот=copy_id=${primary.id}`,
+          };
+        }
+      }
       const ids = m.candidates.map((c) => c.id).join(",");
       return { ...m, status: "conflict", notes: `тир ${m.tier}: несколько кандидатов copy_id=${ids}` };
     }
+
     const cid = m.candidates[0].id;
     const contenders = claims.get(cid);
     if (contenders.length > 1) {
       const others = contenders.filter((id) => id !== m.row.id);
-      return {
-        ...m,
-        status: "conflict",
-        notes: `copy_id=${cid} также запрошена legacy_id=${others.join(",")}`,
-      };
+      return { ...m, status: "conflict", notes: `copy_id=${cid} также запрошена legacy_id=${others.join(",")}` };
     }
     return { ...m, status: "move", notes: `тир ${m.tier}` };
   });
@@ -435,7 +491,7 @@ function resolveConflicts(matchResults) {
 
 // ---------------------------------------------------------------------------
 // Сборка строк отчёта (общий формат для CSV/JSON — JSON несёт дополнительные
-// машиночитаемые поля, которых нет в CSV, см. заголовок файла).
+// машиночитаемые поля, которых нет в CSV).
 // ---------------------------------------------------------------------------
 
 function computeDiffFlags(legacyRow, candidate) {
@@ -446,7 +502,42 @@ function computeDiffFlags(legacyRow, candidate) {
   return flags.join(";");
 }
 
+// Общие для всех строк плана поля-заглушки — чтобы CSV/JSON имели
+// стабильную форму независимо от того, каким путём (алгоритм/override)
+// строка была построена.
+const ROW_DEFAULTS = {
+  twin_copy_legacy_nums: [],
+  winner_old_n: null,
+  winner_legacy_id: null,
+  predicted_delete: null,
+  ref_counts: null,
+  override_unit: null,
+  override_price: null,
+  override_key: null,
+};
+
 function buildRowFromMatch(m) {
+  if (m.status === "move_and_archive_twins") {
+    return {
+      legacy_id: m.row.id,
+      old_n: m.row.oldN,
+      legacy_name: m.row.name,
+      legacy_unit: m.row.unit,
+      legacy_price: m.row.price,
+      record_items: m.row.recordItemsCount,
+      tier: m.tier,
+      copy_id: m.primary.id,
+      copy_legacy_num: m.primary.legacyNum,
+      copy_path: m.primary.path,
+      copy_unit: m.primary.unit,
+      copy_price: m.primary.price,
+      diff_flags: computeDiffFlags(m.row, m.primary),
+      action: "move_and_archive_twins",
+      notes: m.notes,
+      ...ROW_DEFAULTS,
+      twin_copy_legacy_nums: m.twins.map((t) => t.legacyNum),
+    };
+  }
   const candidate = m.status === "move" ? m.candidates[0] : null;
   return {
     legacy_id: m.row.id,
@@ -464,8 +555,7 @@ function buildRowFromMatch(m) {
     diff_flags: candidate ? computeDiffFlags(m.row, candidate) : "",
     action: m.status,
     notes: m.notes,
-    winner_old_n: null,
-    winner_legacy_id: null,
+    ...ROW_DEFAULTS,
   };
 }
 
@@ -486,10 +576,283 @@ function buildMergeRow(loserRow, winnerRow) {
     diff_flags: "dup_name",
     action: "merge_into_winner",
     notes: `дубль имени → merge в legacy_id=${winnerRow.id} (old_n=${winnerRow.oldN ?? "—"})`,
+    ...ROW_DEFAULTS,
     winner_old_n: winnerRow.oldN,
     winner_legacy_id: winnerRow.id,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Поправки (scripts/data/legacy_overrides.json) — см. заголовок файла про
+// два вида строк (с action / только set_unit/set_price).
+// ---------------------------------------------------------------------------
+
+function loadOverridesFile() {
+  if (!fs.existsSync(OVERRIDES_FILE)) return { fullOverrides: [], adjustments: [] };
+  const raw = JSON.parse(fs.readFileSync(OVERRIDES_FILE, "utf8"));
+  const rows = raw.rows ?? [];
+  return {
+    fullOverrides: rows.filter((r) => r.action),
+    adjustments: rows.filter((r) => !r.action),
+  };
+}
+
+function baseOverrideFields(legacyRow) {
+  return {
+    legacy_id: legacyRow.id,
+    old_n: legacyRow.oldN,
+    legacy_name: legacyRow.name,
+    legacy_unit: legacyRow.unit,
+    legacy_price: legacyRow.price,
+    record_items: legacyRow.recordItemsCount,
+    tier: "OVR",
+    ...ROW_DEFAULTS,
+  };
+}
+
+function buildOverrideErrorRow(ov, message, legacyRow, overrideKey) {
+  return {
+    legacy_id: legacyRow ? legacyRow.id : null,
+    old_n: legacyRow ? legacyRow.oldN : (ov.old_n ?? null),
+    legacy_name: legacyRow ? legacyRow.name : (ov.name ?? null),
+    legacy_unit: legacyRow ? legacyRow.unit : null,
+    legacy_price: legacyRow ? legacyRow.price : null,
+    record_items: legacyRow ? legacyRow.recordItemsCount : 0,
+    tier: "OVR",
+    copy_id: null,
+    copy_legacy_num: null,
+    copy_path: "",
+    copy_unit: "",
+    copy_price: null,
+    diff_flags: "",
+    action: "override_unresolved",
+    notes: message,
+    ...ROW_DEFAULTS,
+    override_key: overrideKey,
+  };
+}
+
+function buildOverrideCopyAmbiguousRow(legacyRow, ov, candidates, overrideKey) {
+  const list = candidates.length
+    ? candidates.map((c) => `id=${c.id} legacy_num=${c.legacyNum} "${c.path}"`).join(" | ")
+    : "(ничего не найдено)";
+  return {
+    ...baseOverrideFields(legacyRow),
+    copy_id: null,
+    copy_legacy_num: null,
+    copy_path: "",
+    copy_unit: "",
+    copy_price: null,
+    diff_flags: "",
+    action: "override_unresolved",
+    notes: `copy_name="${ov.copy_name}" — найдено ${candidates.length} совпадений: ${list}`,
+    override_key: overrideKey,
+  };
+}
+
+function buildOverrideArchiveRow(legacyRow, ov, overrideKey) {
+  return {
+    ...baseOverrideFields(legacyRow),
+    copy_id: null,
+    copy_legacy_num: null,
+    copy_path: "",
+    copy_unit: "",
+    copy_price: null,
+    diff_flags: "",
+    action: "archive",
+    notes: "override: archive",
+    override_key: overrideKey,
+  };
+}
+
+async function buildOverrideDeleteRow(client, legacyRow, ov, overrideKey) {
+  const refs = await countReferences(client, legacyRow.id);
+  const total = refs.recordItemsCount + refs.childrenCount + refs.stepBaseRefsCount;
+  return {
+    ...baseOverrideFields(legacyRow),
+    copy_id: null,
+    copy_legacy_num: null,
+    copy_path: "",
+    copy_unit: "",
+    copy_price: null,
+    diff_flags: "",
+    action: "delete_if_unreferenced",
+    notes:
+      total === 0
+        ? "ссылок нет (record_items=0, children=0, step_base_refs=0) — будет физически удалена"
+        : `есть ссылки (record_items=${refs.recordItemsCount}, children=${refs.childrenCount}, ` +
+          `step_base_refs=${refs.stepBaseRefsCount}) — будет заархивирована вместо удаления`,
+    predicted_delete: total === 0,
+    ref_counts: refs,
+    override_key: overrideKey,
+  };
+}
+
+function buildOverrideMatchCopyRow(legacyRow, copy, ov, overrideKey) {
+  return {
+    ...baseOverrideFields(legacyRow),
+    copy_id: copy.id,
+    copy_legacy_num: copy.legacyNum,
+    copy_path: copy.path,
+    copy_unit: copy.unit,
+    copy_price: copy.price,
+    diff_flags: computeDiffFlags(legacyRow, copy),
+    action: "match_copy",
+    notes: `override match_copy: "${ov.copy_name}"`,
+    override_unit: ov.set_unit ?? null,
+    override_price: ov.set_price ?? null,
+    override_key: overrideKey,
+  };
+}
+
+function buildOverridePlaceNextToRow(legacyRow, copy, ov, overrideKey) {
+  return {
+    ...baseOverrideFields(legacyRow),
+    copy_id: copy.id,
+    copy_legacy_num: copy.legacyNum,
+    copy_path: copy.path,
+    copy_unit: copy.unit,
+    copy_price: copy.price,
+    diff_flags: computeDiffFlags(legacyRow, copy),
+    action: "place_next_to",
+    notes:
+      `override place_next_to: "${ov.copy_name}" (parent_id/catalog_type/sbornik_id копии, ` +
+      `sort_order = max+1, variant_label=NULL, своё имя и unit/price сохраняются, копия не архивируется)`,
+    override_unit: ov.set_unit ?? null,
+    override_price: ov.set_price ?? null,
+    override_key: overrideKey,
+  };
+}
+
+// Полные поправки (с action) — вынимают строку из обычного пайплайна ДО
+// tier K/дублей/T1-T5. Возвращает { rows, remainingLegacyRows } — вторые
+// идут дальше в обычное сопоставление.
+async function applyOverrides(client, fullOverrides, legacyRows, copies) {
+  const byOldN = new Map(legacyRows.map((r) => [r.oldN, r]));
+  const byNameNorm = new Map();
+  for (const r of legacyRows) {
+    if (!byNameNorm.has(r.nameNorm)) byNameNorm.set(r.nameNorm, []);
+    byNameNorm.get(r.nameNorm).push(r);
+  }
+  const copiesByNameNorm = new Map();
+  for (const c of copies) {
+    if (!copiesByNameNorm.has(c.nameNorm)) copiesByNameNorm.set(c.nameNorm, []);
+    copiesByNameNorm.get(c.nameNorm).push(c);
+  }
+
+  const handledIds = new Set();
+  const rows = [];
+
+  for (const ov of fullOverrides) {
+    const overrideKey = ov.old_n != null ? String(ov.old_n) : (ov.name ?? "?");
+
+    let legacyRow = null;
+    let idError = null;
+    if (ov.old_n != null) {
+      legacyRow = byOldN.get(ov.old_n) ?? null;
+      if (!legacyRow) idError = `legacy-строка с old_n=${ov.old_n} не найдена среди активных под корнем`;
+    } else if (ov.name) {
+      const norm = normalizeName(ov.name);
+      const matches = byNameNorm.get(norm) ?? [];
+      if (matches.length === 1) legacyRow = matches[0];
+      else {
+        idError =
+          matches.length === 0
+            ? `legacy-строка с именем "${ov.name}" не найдена`
+            : `имя "${ov.name}" неоднозначно (${matches.length} строк: id=${matches.map((m) => m.id).join(",")})`;
+      }
+    } else {
+      idError = "у строки поправки нет ни old_n, ни name";
+    }
+
+    if (idError) {
+      rows.push(buildOverrideErrorRow(ov, idError, null, overrideKey));
+      continue;
+    }
+    handledIds.add(legacyRow.id);
+
+    if (ov.action === "archive") {
+      rows.push(buildOverrideArchiveRow(legacyRow, ov, overrideKey));
+      continue;
+    }
+
+    if (ov.action === "delete_if_unreferenced") {
+      rows.push(await buildOverrideDeleteRow(client, legacyRow, ov, overrideKey));
+      continue;
+    }
+
+    if (ov.action === "match_copy" || ov.action === "place_next_to") {
+      if (!ov.copy_name) {
+        rows.push(buildOverrideErrorRow(ov, `action=${ov.action} требует copy_name`, legacyRow, overrideKey));
+        continue;
+      }
+      const norm = normalizeName(ov.copy_name);
+      const candidates = copiesByNameNorm.get(norm) ?? [];
+      if (candidates.length !== 1) {
+        rows.push(buildOverrideCopyAmbiguousRow(legacyRow, ov, candidates, overrideKey));
+        continue;
+      }
+      const copy = candidates[0];
+      rows.push(
+        ov.action === "match_copy"
+          ? buildOverrideMatchCopyRow(legacyRow, copy, ov, overrideKey)
+          : buildOverridePlaceNextToRow(legacyRow, copy, ov, overrideKey),
+      );
+      continue;
+    }
+
+    rows.push(buildOverrideErrorRow(ov, `неизвестный action="${ov.action}"`, legacyRow, overrideKey));
+  }
+
+  const remainingLegacyRows = legacyRows.filter((r) => !handledIds.has(r.id));
+  return { rows, remainingLegacyRows };
+}
+
+// Поправки без action (только { old_n, set_unit?, set_price? }) — применяются
+// ПОСЛЕ основного пайплайна поверх уже готовой move-строки (слот копии не
+// меняется). Мутирует переданные rows на месте (override_unit/override_price).
+const MOVE_FAMILY_ACTIONS = new Set(["move", "match_copy", "move_and_archive_twins"]);
+
+function applyAdjustments(rows, adjustments) {
+  const byOldN = new Map(rows.filter((r) => r.old_n != null).map((r) => [r.old_n, r]));
+  const report = [];
+  for (const adj of adjustments) {
+    const row = adj.old_n != null ? byOldN.get(adj.old_n) : null;
+    if (!row) {
+      report.push({ adj, applied: false, reason: `строка с old_n=${adj.old_n} не найдена в плане` });
+      continue;
+    }
+    if (!MOVE_FAMILY_ACTIONS.has(row.action)) {
+      report.push({
+        adj,
+        row,
+        applied: false,
+        reason: `action=${row.action} (не move/match_copy/move_and_archive_twins) — поправка не применена`,
+      });
+      continue;
+    }
+    const before = { unit: row.override_unit ?? row.legacy_unit, price: row.override_price ?? row.legacy_price };
+    if (adj.set_unit != null) row.override_unit = adj.set_unit;
+    if (adj.set_price != null) row.override_price = adj.set_price;
+    const after = { unit: row.override_unit ?? row.legacy_unit, price: row.override_price ?? row.legacy_price };
+    report.push({ adj, row, applied: true, before, after });
+  }
+  return report;
+}
+
+// ---------------------------------------------------------------------------
+// buildPlan
+// ---------------------------------------------------------------------------
+
+const RESOLVED_ACTIONS = new Set([
+  "move",
+  "match_copy",
+  "move_and_archive_twins",
+  "place_next_to",
+  "archive",
+  "delete_if_unreferenced",
+  "merge_into_winner",
+]);
 
 export async function buildPlan(client) {
   await assertOldNColumn(client);
@@ -499,19 +862,24 @@ export async function buildPlan(client) {
   const copies = await loadCopyRows(client);
   const indices = buildCopyIndices(copies);
 
-  const tierK = testTierKHypothesis(legacyRows, indices);
+  const { fullOverrides, adjustments } = loadOverridesFile();
+  const { rows: overrideRows, remainingLegacyRows } = await applyOverrides(client, fullOverrides, legacyRows, copies);
 
-  const dupGroups = detectDuplicateGroups(legacyRows);
+  const tierK = testTierKHypothesis(remainingLegacyRows, indices);
+
+  const dupGroups = detectDuplicateGroups(remainingLegacyRows);
   const { loserIds, winnerOf, groupInfo } = resolveDuplicateWinners(dupGroups, indices);
 
-  const subjects = legacyRows.filter((r) => !loserIds.has(r.id));
+  const subjects = remainingLegacyRows.filter((r) => !loserIds.has(r.id));
   const rawMatches = subjects.map((row) => ({ row, ...matchTiers(row, indices, copies, tierK.enabled) }));
   const resolvedMatches = resolveConflicts(rawMatches);
 
-  const moveOrOtherRows = resolvedMatches.map(buildRowFromMatch);
-  const mergeRows = legacyRows.filter((r) => loserIds.has(r.id)).map((r) => buildMergeRow(r, winnerOf.get(r.id)));
+  const algoRows = resolvedMatches.map(buildRowFromMatch);
+  const mergeRows = remainingLegacyRows.filter((r) => loserIds.has(r.id)).map((r) => buildMergeRow(r, winnerOf.get(r.id)));
 
-  const rows = [...moveOrOtherRows, ...mergeRows].sort((a, b) => a.legacy_id - b.legacy_id);
+  const rows = [...overrideRows, ...algoRows, ...mergeRows].sort((a, b) => a.legacy_id - b.legacy_id);
+
+  const adjustmentReport = applyAdjustments(rows, adjustments);
 
   const summary = new Map();
   for (const row of rows) {
@@ -527,6 +895,8 @@ export async function buildPlan(client) {
     tierBreakdown.set(row.tier, (tierBreakdown.get(row.tier) ?? 0) + 1);
   }
 
+  const predictedRemaining = rows.filter((r) => !RESOLVED_ACTIONS.has(r.action)).length;
+
   return {
     generatedAt: new Date().toISOString(),
     rootId: root.id,
@@ -538,6 +908,8 @@ export async function buildPlan(client) {
     duplicateGroups: groupInfo,
     tierBreakdown: [...tierBreakdown.entries()],
     summary: [...summary.entries()],
+    adjustmentReport,
+    predictedRemaining,
     rows,
   };
 }
@@ -564,12 +936,38 @@ function printReport(plan) {
       : `Порог ${TIER_K_THRESHOLD * 100}% НЕ пройден — tier K игнорируется, используются только T1-T5.`,
   );
 
-  console.log("\n--- Дубли имён среди legacy ---");
+  console.log("\n--- Дубли имён среди legacy (вне поправок с action) ---");
   console.log(`Групп дублей: ${plan.duplicateGroups.length}`);
   for (const g of plan.duplicateGroups.slice(0, 10)) {
     console.log(`  "${g.nameNorm}": winner legacy_id=${g.winnerId}, losers legacy_id=${g.loserIds.join(",")}`);
   }
   if (plan.duplicateGroups.length > 10) console.log(`  ...и ещё ${plan.duplicateGroups.length - 10}`);
+
+  console.log("\n--- Строки поправок (scripts/data/legacy_overrides.json, с action) ---");
+  const overrideRows = plan.rows.filter((r) => r.override_key != null);
+  if (!overrideRows.length) {
+    console.log("  (нет)");
+  }
+  for (const r of overrideRows) {
+    const target = r.copy_id ? `copy_id=${r.copy_id} legacy_num=${r.copy_legacy_num} "${r.copy_path}"` : "";
+    console.log(`  key=${r.override_key} legacy_id=${r.legacy_id} "${r.legacy_name}" action=${r.action} ${target}`);
+    console.log(`    ${r.notes}`);
+  }
+
+  console.log("\n--- Поправки к автоплану (без action, только set_unit/set_price) ---");
+  if (!plan.adjustmentReport.length) {
+    console.log("  (нет)");
+  }
+  for (const a of plan.adjustmentReport) {
+    if (a.applied) {
+      console.log(
+        `  old_n=${a.adj.old_n} "${a.row.legacy_name}": unit ${a.before.unit} -> ${a.after.unit}, ` +
+          `price ${a.before.price} -> ${a.after.price} (action=${a.row.action})`,
+      );
+    } else {
+      console.log(`  old_n=${a.adj.old_n}: НЕ применена — ${a.reason}`);
+    }
+  }
 
   console.log("\n--- Сводка по статусам ---");
   for (const [status, s] of plan.summary) {
@@ -605,6 +1003,18 @@ function printReport(plan) {
     }
   }
 
+  const unresolvedOverrides = plan.rows.filter((r) => r.action === "override_unresolved");
+  if (unresolvedOverrides.length) {
+    console.log(`\n--- override_unresolved (${unresolvedOverrides.length}) — требуют уточнения, см. выше ---`);
+    for (const r of unresolvedOverrides) {
+      console.log(`  key=${r.override_key} legacy_id=${r.legacy_id ?? "?"} — ${r.notes}`);
+    }
+  }
+
+  console.log(
+    `\n--- Итог: живых legacy-строк под корнем после применения плана (ожидается 0): ${plan.predictedRemaining} ---`,
+  );
+
   console.log(`\nCSV: ${PLAN_CSV_PATH}`);
   console.log(`JSON: ${PLAN_JSON_PATH}`);
 }
@@ -620,25 +1030,30 @@ function csvEscape(value) {
   return s;
 }
 
-// Столбцы — как в ТЗ (legacy_id..notes), плюс copy_legacy_num в конце: без
-// него план непортируем между staging/прод (см. заголовок файла) — это
-// намеренное расширение списка столбцов, не отступление от него.
+// Столбцы — как в исходном ТЗ (legacy_id..notes), плюс copy_legacy_num и
+// twin_copy_legacy_nums: без них план непортируем между staging/прод и
+// неполон для близнецов (см. заголовок файла) — намеренное расширение
+// списка столбцов, не отступление от него.
 const CSV_COLUMNS = [
   "legacy_id", "old_n", "legacy_name", "legacy_unit", "legacy_price", "record_items",
   "tier", "copy_id", "copy_path", "copy_unit", "copy_price", "diff_flags", "action", "notes",
-  "copy_legacy_num",
+  "copy_legacy_num", "twin_copy_legacy_nums",
 ];
+
+function csvValue(row, column) {
+  if (column === "twin_copy_legacy_nums") return (row[column] ?? []).join("|");
+  return row[column];
+}
 
 function writeCsv(rows, path) {
   const lines = [CSV_COLUMNS.join(",")];
   for (const row of rows) {
-    lines.push(CSV_COLUMNS.map((c) => csvEscape(row[c])).join(","));
+    lines.push(CSV_COLUMNS.map((c) => csvEscape(csvValue(row, c))).join(","));
   }
   fs.writeFileSync(path, lines.join("\n") + "\n", "utf8");
 }
 
-// Ключ строки в JSON-плане — old_n, запасной legacy_id (см. заголовок файла
-// про портируемость между окружениями).
+// Ключ строки в JSON-плане — old_n, запасной legacy_id.
 function planRowKey(row) {
   return row.old_n != null ? String(row.old_n) : `legacy:${row.legacy_id}`;
 }
@@ -655,6 +1070,7 @@ function writePlanJson(plan, path) {
     tierKRatio: plan.tierK.ratio,
     totalActiveLegacy: plan.totalActiveLegacy,
     totalCopies: plan.totalCopies,
+    predictedRemaining: plan.predictedRemaining,
     summary: Object.fromEntries(plan.summary),
     rows: rowsByKey,
   };
@@ -671,15 +1087,9 @@ function loadPlanFile(path) {
   return { ...raw, rows: Object.values(raw.rows) };
 }
 
-function loadOverrides(path) {
-  if (!path) return {};
-  return JSON.parse(fs.readFileSync(path, "utf8"));
-}
-
 // Резолвит live-строку legacy по old_n; при отсутствии old_n (или если по
-// нему ничего не нашлось) — запасной ключ name+unit (без учёта регистра/
-// пробелов), но ТОЛЬКО если он даёт РОВНО одно совпадение — иначе строка
-// считается нерезолвленной (лучше пропустить и сообщить, чем угадать не ту).
+// нему ничего не нашлось) — запасной ключ name+unit, но ТОЛЬКО если он даёт
+// РОВНО одно совпадение — иначе строка считается нерезолвленной.
 async function resolveLegacyRow(client, { oldN, name, unit }) {
   if (oldN != null) {
     const { rows } = await client.query(
@@ -712,35 +1122,62 @@ async function resolveCopyByLegacyNum(client, legacyNum) {
 }
 
 // Предварительный резолв (без записи) — используется и в preview (--apply
-// без --confirm), и как первый шаг runApply (--confirm).
-async function resolvePlanRow(client, row, overrides) {
-  if (row.action === "move") {
+// без --confirm), и как первый шаг runApply (--confirm). unit/price-
+// override'ы едут вместе со строкой плана (row.override_unit/override_price) —
+// отдельный файл поправок на apply уже не перечитывается.
+async function resolvePlanRow(client, row) {
+  if (row.action === "move" || row.action === "match_copy") {
     const legacy = await resolveLegacyRow(client, { oldN: row.old_n, name: row.legacy_name, unit: row.legacy_unit });
     if (legacy.error) return { row, kind: "move", error: legacy.error };
     const copy = await resolveCopyByLegacyNum(client, row.copy_legacy_num);
     if (copy.error) return { row, kind: "move", error: copy.error };
-    const override = overrides[planRowKey(row)] ?? {};
-    return { row, kind: "move", legacy, copy, override };
+    return { row, kind: "move", legacy, copy };
+  }
+  if (row.action === "move_and_archive_twins") {
+    const legacy = await resolveLegacyRow(client, { oldN: row.old_n, name: row.legacy_name, unit: row.legacy_unit });
+    if (legacy.error) return { row, kind: "twins", error: legacy.error };
+    const primary = await resolveCopyByLegacyNum(client, row.copy_legacy_num);
+    if (primary.error) return { row, kind: "twins", error: `слот: ${primary.error}` };
+    const twins = [];
+    for (const legacyNum of row.twin_copy_legacy_nums ?? []) {
+      const twin = await resolveCopyByLegacyNum(client, legacyNum);
+      if (twin.error) return { row, kind: "twins", error: `близнец legacy_num=${legacyNum}: ${twin.error}` };
+      twins.push(twin);
+    }
+    return { row, kind: "twins", legacy, primary, twins };
+  }
+  if (row.action === "place_next_to") {
+    const legacy = await resolveLegacyRow(client, { oldN: row.old_n, name: row.legacy_name, unit: row.legacy_unit });
+    if (legacy.error) return { row, kind: "place_next_to", error: legacy.error };
+    const copy = await resolveCopyByLegacyNum(client, row.copy_legacy_num);
+    if (copy.error) return { row, kind: "place_next_to", error: copy.error };
+    return { row, kind: "place_next_to", legacy, copy };
+  }
+  if (row.action === "archive") {
+    const legacy = await resolveLegacyRow(client, { oldN: row.old_n, name: row.legacy_name, unit: row.legacy_unit });
+    if (legacy.error) return { row, kind: "archive", error: legacy.error };
+    return { row, kind: "archive", legacy };
+  }
+  if (row.action === "delete_if_unreferenced") {
+    const legacy = await resolveLegacyRow(client, { oldN: row.old_n, name: row.legacy_name, unit: row.legacy_unit });
+    if (legacy.error) return { row, kind: "delete_if_unreferenced", error: legacy.error };
+    return { row, kind: "delete_if_unreferenced", legacy };
   }
   if (row.action === "merge_into_winner") {
     const loser = await resolveLegacyRow(client, { oldN: row.old_n, name: row.legacy_name, unit: row.legacy_unit });
     if (loser.error) return { row, kind: "merge", error: loser.error };
-    const winner = await resolveLegacyRow(client, {
-      oldN: row.winner_old_n,
-      name: null,
-      unit: null,
-    });
+    const winner = await resolveLegacyRow(client, { oldN: row.winner_old_n, name: null, unit: null });
     if (winner.error) return { row, kind: "merge", error: `winner: ${winner.error}` };
     return { row, kind: "merge", loser, winner };
   }
   return { row, kind: "skip" };
 }
 
-async function previewApply(client, plan, overrides) {
-  const byKind = { move: [], merge: [], skip: [] };
+async function previewApply(client, plan) {
+  const byKind = { move: [], twins: [], place_next_to: [], archive: [], delete_if_unreferenced: [], merge: [], skip: [] };
   const errors = [];
   for (const row of plan.rows) {
-    const resolved = await resolvePlanRow(client, row, overrides);
+    const resolved = await resolvePlanRow(client, row);
     if (resolved.error) {
       errors.push({ row, error: resolved.error });
       continue;
@@ -750,9 +1187,13 @@ async function previewApply(client, plan, overrides) {
 
   console.log("--- Предпросмотр apply (без --confirm — ничего не меняется) ---");
   console.log(`Строк в плане: ${plan.rows.length}`);
-  console.log(`move (резолвлены, будут перенесены): ${byKind.move.length}`);
+  console.log(`move/match_copy (резолвлены): ${byKind.move.length}`);
+  console.log(`move_and_archive_twins (резолвлены): ${byKind.twins.length}`);
+  console.log(`place_next_to (резолвлены): ${byKind.place_next_to.length}`);
+  console.log(`archive (резолвлены): ${byKind.archive.length}`);
+  console.log(`delete_if_unreferenced (резолвлены): ${byKind.delete_if_unreferenced.length}`);
   console.log(`merge_into_winner (резолвлены): ${byKind.merge.length}`);
-  console.log(`conflict/suggestion/manual (не трогаются): ${byKind.skip.length}`);
+  console.log(`conflict/suggestion/manual/override_unresolved (не трогаются): ${byKind.skip.length}`);
   if (errors.length) {
     console.log(`\nНЕ УДАЛОСЬ РЕЗОЛВИТЬ (${errors.length}) — --confirm их тоже пропустит и сообщит:`);
     for (const e of errors.slice(0, 20)) {
@@ -763,14 +1204,48 @@ async function previewApply(client, plan, overrides) {
   console.log("\nЗапустите с --confirm, чтобы применить.");
 }
 
-async function runApply(client, plan, overrides) {
-  const counters = { moved: 0, copiesArchived: 0, recordItemsRelinked: 0, merged: 0, alreadyDone: 0, unresolved: 0 };
+// Общий UPDATE work_types для move/match_copy/twins (переезд листа в слот
+// копии) — вынесен в функцию, т.к. используется и для обычного move, и для
+// слота близнецов (move_and_archive_twins), различается только источником
+// полей (copy vs primary) и legacy.id.
+async function applyMoveUpdate(client, legacyId, copySnapshot, row) {
+  const setParts = [
+    "parent_id = $1", "level = 5", "catalog_type = $2", "sbornik_id = $3",
+    "sort_order = $4", "name = $5", "variant_label = $6", "legacy_num = $7",
+  ];
+  const values = [
+    copySnapshot.parent_id, copySnapshot.catalog_type, copySnapshot.sbornik_id,
+    copySnapshot.sort_order, copySnapshot.name, copySnapshot.variant_label, copySnapshot.legacy_num,
+  ];
+  let idx = values.length + 1;
+  if (row.override_unit != null) { setParts.push(`unit = $${idx}`); values.push(row.override_unit); idx++; }
+  if (row.override_price != null) { setParts.push(`price = $${idx}`); values.push(row.override_price); idx++; }
+  values.push(legacyId);
+  await client.query(`UPDATE work_types SET ${setParts.join(", ")} WHERE id = $${idx}`, values);
+}
+
+async function archiveCopyAndRelink(client, legacyId, copyId) {
+  const { rowCount } = await client.query(
+    `UPDATE record_items SET work_type_id = $1 WHERE work_type_id = $2`,
+    [legacyId, copyId],
+  );
+  await client.query(`UPDATE work_types SET status = 'archived', archived_at = now() WHERE id = $1`, [copyId]);
+  return rowCount;
+}
+
+async function runApply(client, plan) {
+  const counters = {
+    moved: 0, copiesArchived: 0, recordItemsRelinked: 0, merged: 0,
+    placedNextTo: 0, archivedOverride: 0, deleted: 0, archivedInsteadOfDeleted: 0,
+    twinsMoved: 0, twinCopiesArchived: 0,
+    alreadyDone: 0, unresolved: 0,
+  };
   const unresolvedRows = [];
 
   await client.query("BEGIN");
   try {
     for (const row of plan.rows) {
-      const resolved = await resolvePlanRow(client, row, overrides);
+      const resolved = await resolvePlanRow(client, row);
       if (resolved.error) {
         counters.unresolved++;
         unresolvedRows.push({ row, error: resolved.error });
@@ -778,61 +1253,93 @@ async function runApply(client, plan, overrides) {
       }
 
       if (resolved.kind === "move") {
-        const { legacy, copy, override } = resolved;
+        const { legacy, copy } = resolved;
         if (copy.status === "archived") {
-          // Уже перенесено в прошлый прогон (копия архивируется последним
-          // шагом move — см. ниже) — идемпотентно пропускаем.
           counters.alreadyDone++;
           continue;
         }
-
-        const setParts = [
-          "parent_id = $1", "level = 5", "catalog_type = $2", "sbornik_id = $3",
-          "sort_order = $4", "name = $5", "variant_label = $6", "legacy_num = $7",
-        ];
-        const values = [
-          copy.parent_id, copy.catalog_type, copy.sbornik_id,
-          copy.sort_order, copy.name, copy.variant_label, copy.legacy_num,
-        ];
-        let idx = values.length + 1;
-        if (override.unit != null) { setParts.push(`unit = $${idx}`); values.push(override.unit); idx++; }
-        if (override.price != null) { setParts.push(`price = $${idx}`); values.push(override.price); idx++; }
-        values.push(legacy.id);
-
-        await client.query(`UPDATE work_types SET ${setParts.join(", ")} WHERE id = $${idx}`, values);
-
-        const { rowCount } = await client.query(
-          `UPDATE record_items SET work_type_id = $1 WHERE work_type_id = $2`,
-          [legacy.id, copy.id],
-        );
-        counters.recordItemsRelinked += rowCount;
-
-        await client.query(
-          `UPDATE work_types SET status = 'archived', archived_at = now() WHERE id = $1`,
-          [copy.id],
-        );
-
+        await applyMoveUpdate(client, legacy.id, copy, row);
+        counters.recordItemsRelinked += await archiveCopyAndRelink(client, legacy.id, copy.id);
         counters.moved++;
         counters.copiesArchived++;
+      } else if (resolved.kind === "twins") {
+        const { legacy, primary, twins } = resolved;
+        if (primary.status === "archived") {
+          counters.alreadyDone++;
+          continue;
+        }
+        await applyMoveUpdate(client, legacy.id, primary, row);
+        counters.recordItemsRelinked += await archiveCopyAndRelink(client, legacy.id, primary.id);
+        counters.copiesArchived++;
+        for (const twin of twins) {
+          if (twin.status === "archived") continue; // этот конкретный близнец уже обработан раньше
+          counters.recordItemsRelinked += await archiveCopyAndRelink(client, legacy.id, twin.id);
+          counters.twinCopiesArchived++;
+        }
+        counters.twinsMoved++;
+      } else if (resolved.kind === "place_next_to") {
+        const { legacy, copy } = resolved;
+        if (legacy.parent_id !== plan.rootId) {
+          // Единственный способ, которым legacy-строка теряет parent_id=root, —
+          // это уже выполненный шаг этого скрипта (move/match_copy/twins/
+          // place_next_to/archive/delete_if_unreferenced) — копия для
+          // place_next_to никогда не архивируется, поэтому её статус не
+          // годится как признак идемпотентности.
+          counters.alreadyDone++;
+          continue;
+        }
+        const { rows: maxRows } = await client.query(
+          `SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM work_types WHERE parent_id = $1`,
+          [copy.parent_id],
+        );
+        const setParts = [
+          "parent_id = $1", "level = 5", "catalog_type = $2", "sbornik_id = $3",
+          "sort_order = $4", "variant_label = NULL",
+        ];
+        const values = [copy.parent_id, copy.catalog_type, copy.sbornik_id, maxRows[0].next];
+        let idx = values.length + 1;
+        if (row.override_unit != null) { setParts.push(`unit = $${idx}`); values.push(row.override_unit); idx++; }
+        if (row.override_price != null) { setParts.push(`price = $${idx}`); values.push(row.override_price); idx++; }
+        values.push(legacy.id);
+        await client.query(`UPDATE work_types SET ${setParts.join(", ")} WHERE id = $${idx}`, values);
+        counters.placedNextTo++;
+      } else if (resolved.kind === "archive") {
+        const { legacy } = resolved;
+        if (legacy.status === "archived") {
+          counters.alreadyDone++;
+          continue;
+        }
+        await client.query(`UPDATE work_types SET status = 'archived', archived_at = now() WHERE id = $1`, [legacy.id]);
+        counters.archivedOverride++;
+      } else if (resolved.kind === "delete_if_unreferenced") {
+        const { legacy } = resolved;
+        if (legacy.status === "archived") {
+          counters.alreadyDone++;
+          continue;
+        }
+        const refs = await countReferences(client, legacy.id);
+        const total = refs.recordItemsCount + refs.childrenCount + refs.stepBaseRefsCount;
+        if (total === 0) {
+          await client.query(`DELETE FROM work_types WHERE id = $1`, [legacy.id]);
+          counters.deleted++;
+        } else {
+          await client.query(`UPDATE work_types SET status = 'archived', archived_at = now() WHERE id = $1`, [legacy.id]);
+          counters.archivedInsteadOfDeleted++;
+          console.log(
+            `  old_n=${row.old_n} legacy_id=${legacy.id}: есть ссылки (record_items=${refs.recordItemsCount}, ` +
+              `children=${refs.childrenCount}, step_base_refs=${refs.stepBaseRefsCount}) — заархивирована вместо удаления`,
+          );
+        }
       } else if (resolved.kind === "merge") {
         const { loser, winner } = resolved;
         if (loser.status === "archived") {
           counters.alreadyDone++;
           continue;
         }
-        const { rowCount } = await client.query(
-          `UPDATE record_items SET work_type_id = $1 WHERE work_type_id = $2`,
-          [winner.id, loser.id],
-        );
-        counters.recordItemsRelinked += rowCount;
-
-        await client.query(
-          `UPDATE work_types SET status = 'archived', archived_at = now() WHERE id = $1`,
-          [loser.id],
-        );
+        counters.recordItemsRelinked += await archiveCopyAndRelink(client, winner.id, loser.id);
         counters.merged++;
       }
-      // kind === "skip" (conflict/suggestion/manual) — ничего не делаем.
+      // kind === "skip" (conflict/suggestion/manual/override_unresolved) — ничего не делаем.
     }
 
     const { rows: remainingRows } = await client.query(
@@ -849,8 +1356,14 @@ async function runApply(client, plan, overrides) {
   }
 
   console.log("--- Apply выполнен (COMMIT) ---");
-  console.log(`Перенесено legacy-строк: ${counters.moved}`);
-  console.log(`Копий заархивировано: ${counters.copiesArchived}`);
+  console.log(`Перенесено (move/match_copy): ${counters.moved}`);
+  console.log(`Перенесено близнецами (move_and_archive_twins): ${counters.twinsMoved}`);
+  console.log(`Копий заархивировано (move/match_copy/слот близнецов): ${counters.copiesArchived}`);
+  console.log(`Доп. копий-близнецов заархивировано: ${counters.twinCopiesArchived}`);
+  console.log(`Размещено рядом (place_next_to): ${counters.placedNextTo}`);
+  console.log(`Заархивировано (override archive): ${counters.archivedOverride}`);
+  console.log(`Удалено физически (delete_if_unreferenced): ${counters.deleted}`);
+  console.log(`Заархивировано вместо удаления (были ссылки): ${counters.archivedInsteadOfDeleted}`);
   console.log(`record_items перепривязано: ${counters.recordItemsRelinked}`);
   console.log(`Дублей смёржено (merge_into_winner): ${counters.merged}`);
   console.log(`Уже было сделано раньше (пропущено идемпотентно): ${counters.alreadyDone}`);
@@ -871,7 +1384,7 @@ async function runApply(client, plan, overrides) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { apply, confirm, planPath, overridesPath } = parseArgs();
+  const { apply, confirm, planPath } = parseArgs();
 
   if (!apply) {
     const client = await pool.connect();
@@ -892,16 +1405,15 @@ async function main() {
     return;
   }
   const plan = loadPlanFile(planPath);
-  const overrides = loadOverrides(overridesPath);
 
   const client = await pool.connect();
   try {
     await assertOldNColumn(client);
     if (!confirm) {
-      await previewApply(client, plan, overrides);
+      await previewApply(client, plan);
       return;
     }
-    await runApply(client, plan, overrides);
+    await runApply(client, plan);
   } finally {
     client.release();
   }
@@ -923,37 +1435,57 @@ if (isMainModule) {
  * Примеры запуска (на сервере, из папки бэкенда — там же лежит .env):
  *
  *   node scripts/migrate-legacy-root.js --dry-run
- *   (флаг --dry-run опционален — это поведение по умолчанию без --apply;
- *   можно передавать явно, скрипт его просто игнорирует отдельно от
- *   проверки "нет --apply")
+ *   (флаг --dry-run опционален — это поведение по умолчанию без --apply)
  *
  *   node scripts/migrate-legacy-root.js --apply --plan /tmp/legacy_plan.json
  *     (без --confirm — только печатает, что будет сделано)
  *
  *   node scripts/migrate-legacy-root.js --apply --plan /tmp/legacy_plan.json --confirm
- *     (одна транзакция, реально переносит/архивирует/перепривязывает)
+ *     (одна транзакция, реально переносит/архивирует/удаляет/перепривязывает)
  *
- *   node scripts/migrate-legacy-root.js --apply --plan /tmp/legacy_plan.json \
- *     --overrides /tmp/legacy_overrides.json --confirm
+ * scripts/data/legacy_overrides.json — { "rows": [...] }, два вида строк
+ * (см. подробный разбор в заголовке файла):
+ *   - с action: match_copy | place_next_to | archive | delete_if_unreferenced
+ *     — { old_n?, name?, action, copy_name?, set_unit?, set_price? };
+ *     адресация legacy-строки — old_n, иначе точное совпадение name;
+ *     адресация копии (match_copy/place_next_to) — copy_name (точное
+ *     нормализованное совпадение среди активных source='user_added'; 0 или
+ *     >1 совпадений — строка попадает в отчёт как override_unresolved со
+ *     списком найденных вариантов, ничего не выбирается автоматически).
+ *   - без action: { old_n, set_unit?, set_price? } — поправка ПОВЕРХ
+ *     результата обычного автосопоставления (ожидается action=move/
+ *     match_copy/move_and_archive_twins); если строка свелась к чему-то
+ *     другому — поправка не применяется, это видно в отчёте
+ *     ("Поправки к автоплану").
  *
- * overrides.json — { "<old_n или legacy:<id>>": { "unit": "...", "price": 123 } }
- * (тот же ключ, что в legacy_plan.json — см. planRowKey). Переопределяет
- * unit/price ТОЛЬКО для action=move — на остальные действия не влияет.
+ * Правило близнецов (move_and_archive_twins): несколько кандидатов-копий на
+ * тирах K/T1-T4, но все с одинаковыми нормализованными name/unit/price И
+ * одинаковым parent_id — не конфликт, а дублирующиеся строки одной позиции.
+ * Слот — копия с минимальным id, остальные архивируются, их record_items
+ * тоже перепривязываются на перенесённую строку.
  *
- * Идемпотентность --apply --confirm: перед переносом каждая строка резолвится
- * заново по old_n/legacy_num (см. заголовок файла); если копия конкретной
- * move-строки уже в статусе archived — перенос этой строки был выполнен в
- * прошлый прогон, шаг пропускается (alreadyDone), сообщается в итоге, СБОЙ
- * не считается. Аналогично для merge_into_winner — по статусу проигравшего.
- * Строки, которые не удалось резолвить (например, if old_n/legacy_num не
- * нашлись в этом окружении), пропускаются с сообщением, не обрывая
- * транзакцию целиком — остальные строки применяются.
+ * delete_if_unreferenced: на --apply проверяются ссылки на строку
+ * (record_items.work_type_id, work_types.parent_id,
+ * work_types.step_base_work_type_id — единственные FK на work_types(id),
+ * requests вообще не ссылается). 0 ссылок — строка физически удаляется
+ * (DELETE); есть ссылки — вместо удаления архивируется, с явным сообщением
+ * в выводе. dry-run показывает то же самое предсказательно (не гарантирует
+ * состояние на момент apply — между запусками БД может измениться).
+ *
+ * Идемпотентность --apply --confirm: каждая строка резолвится заново по
+ * old_n/legacy_num. Признак "уже сделано в прошлый прогон" — свой для
+ * каждого действия: для move/match_copy/слота близнецов — копия уже
+ * archived; для place_next_to (копия НЕ архивируется) — parent_id
+ * legacy-строки уже не равен id корня; для archive/delete_if_unreferenced —
+ * сама строка уже archived; для merge_into_winner — проигравший уже
+ * archived. Строки, которые не удалось резолвить, пропускаются с
+ * сообщением, не обрывая транзакцию целиком.
  *
  * Что скрипт НЕ трогает: legacy_root (сам корень), 3 архивные legacy-строки
  * (загружаются только status='active'), is_step_item/is_counter_step/
- * step_base_work_type_id/step_unit_label ни у листа, ни у копии, requests
- * (вообще не ссылается на work_types — проверено в раунде 2 диагностики).
- * source старой строки остаётся 'legacy' — плоский список мастеров и бейдж
- * «Наш» (см. workTypesRouter.listWhere в directories.js — source IN
- * ('legacy','manual')) продолжают работать как раньше.
+ * step_base_work_type_id/step_unit_label ни у листа, ни у копии, requests.
+ * source старой строки остаётся 'legacy' (кроме delete_if_unreferenced,
+ * когда строка удаляется физически) — плоский список мастеров и бейдж
+ * «Наш» (source IN ('legacy','manual'), см. directories.js) продолжают
+ * работать как раньше.
  */

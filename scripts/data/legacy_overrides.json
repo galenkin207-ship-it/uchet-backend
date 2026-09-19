@@ -1,0 +1,19 @@
+{
+ "rows": [
+  {"old_n": 144, "action": "match_copy", "copy_name": "Замена стекла в душевой кабине"},
+  {"old_n": 216, "action": "match_copy", "copy_name": "Монтаж душевого поддона"},
+  {"old_n": 930, "action": "match_copy", "copy_name": "Штукатурка оконных откосов"},
+  {"old_n": 476, "action": "match_copy", "copy_name": "Погрузка разгрузка строительного материала (вручную)"},
+  {"old_n": 731, "action": "place_next_to", "copy_name": "Установка водонагревателя накопительного (бойлер)"},
+  {"old_n": 369, "action": "place_next_to", "copy_name": "Монтаж ящика с рубильником (до 100 А) (с подключением жил приходящих и уходящих кабельных линий)", "set_unit": "шт", "set_price": 6000},
+  {"old_n": 372, "action": "place_next_to", "copy_name": "Монтаж ящика с рубильником (до 100 А) (с подключением жил приходящих и уходящих кабельных линий)", "set_unit": "шт", "set_price": 9000},
+  {"old_n": 204, "action": "place_next_to", "copy_name": "Монтаж ящика с рубильником (до 100 А) (с подключением жил приходящих и уходящих кабельных линий)"},
+  {"old_n": 379, "action": "place_next_to", "copy_name": "Грунтование поверхностей"},
+  {"old_n": 471, "action": "place_next_to", "copy_name": "Погрузка разгрузка строительного мусора"},
+  {"old_n": 472, "action": "place_next_to", "copy_name": "Погрузка разгрузка строительного мусора"},
+  {"old_n": 630, "action": "place_next_to", "copy_name": "Разборка кирпичной кладки"},
+  {"old_n": 341, "action": "delete_if_unreferenced"},
+  {"name": "Шахматы пробные 2 проба", "action": "archive"},
+  {"old_n": 909, "set_unit": "п.м.", "set_price": 400}
+ ]
+}
