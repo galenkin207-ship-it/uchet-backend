@@ -9,6 +9,7 @@ import {
   checkNameUniqueAmongSiblings,
   checkGesnCodeUnique,
   buildLeafDetail,
+  archiveWorkType,
 } from "./work-types-shared.js";
 
 // Роутер поверх древовидной структуры work_types (level, parent_id,
@@ -143,8 +144,7 @@ workTypesTreeRouter.get(
         "wt.parent_id IS NULL AND wt.level = 1 AND wt.catalog_type = $1",
         [type],
       );
-      const canEdit = isAdminLike(req.user);
-      return res.json({ items: rows.map((r) => ({ ...r, can_edit: canEdit })) });
+      return res.json({ items: rows.map((r) => annotateTreeItem(r, req.user)) });
     }
 
     const id = Number(parentId);
@@ -159,9 +159,8 @@ workTypesTreeRouter.get(
     const parentNameStripped = parentRows[0] ? stripCodePrefix(parentRows[0].name) : null;
 
     const items = await expandDuplicateGroups(id, parentNameStripped);
-    const canEdit = isAdminLike(req.user);
 
-    res.json({ items: items.map((r) => ({ ...r, can_edit: canEdit })) });
+    res.json({ items: items.map((r) => annotateTreeItem(r, req.user)) });
   }),
 );
 
@@ -190,6 +189,18 @@ workTypesTreeRouter.get(
     res.json({ items: rows });
   }),
 );
+
+// can_edit — как и раньше, для листьев (level=5): любой admin/curator.
+// can_edit_node — только для контейнеров (level<5) и только для admin:
+// POST/PATCH /nodes и archive контейнера теперь admin-only (curator — 403),
+// в отличие от операций над листьями.
+function annotateTreeItem(row, user) {
+  const item = { ...row, can_edit: isAdminLike(user) };
+  if (row.level < 5) {
+    item.can_edit_node = !!user && user.role === "admin";
+  }
+  return item;
+}
 
 // Та же нормализация/токенизация, что и в client-side smart-search (нет
 // общего пакета между фронтом и бэкендом — логика продублирована здесь).
@@ -520,7 +531,7 @@ workTypesTreeRouter.patch(
 // наследуются от родителя (catalog_type можно переопределить явно).
 workTypesTreeRouter.post(
   "/nodes",
-  requireRole("admin", "curator"),
+  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const { parent_id, name, catalog_type, sort_order } = req.body || {};
     if (!name || !String(name).trim()) {
@@ -585,7 +596,13 @@ workTypesTreeRouter.post(
     // Свежесозданный узел заведомо без детей — не через fetchChildrenRows
     // (её WHERE требует хотя бы один настоящий лист в поддереве, у пустого
     // контейнера такого ещё нет, и запрос вернул бы 0 строк).
-    const node = { ...finalRows[0], has_children: false, has_counter_steps: false, can_edit: true };
+    const node = {
+      ...finalRows[0],
+      has_children: false,
+      has_counter_steps: false,
+      can_edit: true,
+      can_edit_node: true,
+    };
 
     await insertAuditLog(pool, {
       entityType: "work_type",
@@ -603,12 +620,11 @@ workTypesTreeRouter.post(
 
 // PATCH /nodes/:id — переименование контейнера (+ sort_order). Смена
 // родителя намеренно не поддерживается здесь (не нужна по ТЗ) — для узлов
-// это отдельная операция, которой пока нет. Архивация — через уже
-// существующий PATCH /:id/archive (с проверкой на неархивные листья внутри,
-// см. directories.js).
+// это отдельная операция, которой пока нет. Архивация — отдельным
+// PATCH /nodes/:id/archive ниже.
 workTypesTreeRouter.patch(
   "/nodes/:id",
-  requireRole("admin", "curator"),
+  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) {
@@ -679,6 +695,108 @@ workTypesTreeRouter.patch(
       after: updated,
     });
 
-    res.json({ ...updated, can_edit: true });
+    res.json({ ...updated, can_edit: true, can_edit_node: true });
+  }),
+);
+
+// PATCH /nodes/:id/archive — архивация контейнера. Отдельно от общего
+// PATCH /:id/archive (directories.js, работает и для листьев, и для
+// контейнеров) — этот путь только для контейнеров и только admin (curator
+// не может архивировать разделы дерева, в отличие от листьев). Общая логика
+// (включая запрет архивации при неархивных листьях внутри) — в
+// archiveWorkType (work-types-shared.js), чтобы не дублировать SQL.
+workTypesTreeRouter.patch(
+  "/nodes/:id/archive",
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: "id должен быть целым числом" });
+    }
+
+    const { rows: checkRows } = await pool.query(`SELECT level FROM work_types WHERE id = $1`, [id]);
+    if (!checkRows[0]) return res.status(404).json({ error: "not found" });
+    if (checkRows[0].level === 5) {
+      return res.status(400).json({ error: "Это лист — используйте /:id/archive" });
+    }
+
+    const result = await archiveWorkType(pool, id);
+    if (result.conflict) return res.status(409).json({ error: result.conflict });
+
+    await insertAuditLog(pool, {
+      entityType: "work_type",
+      entityId: id,
+      action: "update",
+      actorUserId: req.user.id,
+      actorName: req.user.full_name,
+      before: result.before,
+      after: result.after,
+    });
+
+    res.json({ ...result.after, can_edit_node: true });
+  }),
+);
+
+// GET /nodes/:id/usage — диагностика перед архивацией/правкой контейнера:
+// сколько живых/архивных листьев и подконтейнеров у него в поддереве (на
+// любой глубине) и сколько record_items ссылаются на его листья. Только
+// admin — тот же круг, что и остальные /nodes-эндпоинты.
+workTypesTreeRouter.get(
+  "/nodes/:id/usage",
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: "id должен быть целым числом" });
+    }
+
+    const { rows: nodeRows } = await pool.query(
+      `SELECT id, level, name, status FROM work_types WHERE id = $1`,
+      [id],
+    );
+    const node = nodeRows[0];
+    if (!node) return res.status(404).json({ error: "not found" });
+    if (node.level === 5) {
+      return res.status(400).json({ error: "Это лист — используйте /:id/detail" });
+    }
+
+    const { rows: countRows } = await pool.query(
+      `WITH RECURSIVE sub AS (
+         SELECT id, level, status FROM work_types WHERE id = $1
+         UNION ALL
+         SELECT wt.id, wt.level, wt.status FROM work_types wt JOIN sub ON wt.parent_id = sub.id
+       )
+       SELECT
+         count(*) FILTER (WHERE level = 5 AND status <> 'archived') AS leaves_active,
+         count(*) FILTER (WHERE level = 5 AND status = 'archived') AS leaves_archived,
+         count(*) FILTER (WHERE level < 5 AND status <> 'archived' AND id <> $1) AS containers_active,
+         count(*) FILTER (WHERE level < 5 AND status = 'archived' AND id <> $1) AS containers_archived
+       FROM sub`,
+      [id],
+    );
+
+    const { rows: recordRows } = await pool.query(
+      `WITH RECURSIVE sub AS (
+         SELECT id, level FROM work_types WHERE id = $1
+         UNION ALL
+         SELECT wt.id, wt.level FROM work_types wt JOIN sub ON wt.parent_id = sub.id
+       )
+       SELECT count(*) AS record_items_count
+       FROM record_items
+       WHERE work_type_id IN (SELECT id FROM sub WHERE level = 5)`,
+      [id],
+    );
+
+    res.json({
+      id: node.id,
+      name: node.name,
+      level: node.level,
+      status: node.status,
+      leaves_active: Number(countRows[0].leaves_active),
+      leaves_archived: Number(countRows[0].leaves_archived),
+      containers_active: Number(countRows[0].containers_active),
+      containers_archived: Number(countRows[0].containers_archived),
+      record_items_count: Number(recordRows[0].record_items_count),
+    });
   }),
 );

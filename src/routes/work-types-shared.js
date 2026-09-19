@@ -123,3 +123,46 @@ export async function buildLeafDetail(executor, id) {
   const ancestors = await getAncestorChain(executor, id);
   return { ...leaf, ancestors, materials: [] };
 }
+
+// Архивация строки work_types (лист ИЛИ контейнер). Для контейнера (level<5)
+// запрещает архивацию, пока внутри (на любой глубине поддерева) остаются
+// неархивные листья — иначе они молча "пропадают" из каскада (родителя не
+// найти через /tree), хотя сами формально всё ещё активны. Общая для
+// directories.js (PATCH /:id/archive — леф+контейнер, как было) и
+// work-types-tree.js (PATCH /nodes/:id/archive — только контейнер).
+export async function archiveWorkType(executor, id) {
+  const { rows: beforeRows } = await executor.query(
+    `SELECT id, name, unit, price, status, archived_at, level FROM work_types WHERE id = $1`,
+    [id],
+  );
+  const before = beforeRows[0];
+  if (!before) return { notFound: true };
+
+  if (before.level < 5) {
+    const { rows: activeLeafRows } = await executor.query(
+      `WITH RECURSIVE sub AS (
+         SELECT id FROM work_types WHERE id = $1
+         UNION ALL
+         SELECT wt.id FROM work_types wt JOIN sub ON wt.parent_id = sub.id
+       )
+       SELECT 1 FROM work_types
+        WHERE id IN (SELECT id FROM sub) AND id <> $1 AND level = 5 AND status <> 'archived'
+        LIMIT 1`,
+      [id],
+    );
+    if (activeLeafRows.length) {
+      return {
+        conflict: "Внутри раздела есть неархивные виды работ — сначала заархивируйте их",
+        before,
+      };
+    }
+  }
+
+  const { rows } = await executor.query(
+    `UPDATE work_types SET status = 'archived', archived_at = now()
+     WHERE id = $1
+     RETURNING id, name, unit, price, status, archived_at`,
+    [id],
+  );
+  return { before, after: rows[0] };
+}

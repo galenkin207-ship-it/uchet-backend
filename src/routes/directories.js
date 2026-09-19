@@ -10,6 +10,7 @@ import {
   checkNameUniqueAmongSiblings,
   checkGesnCodeUnique,
   buildLeafDetail,
+  archiveWorkType,
 } from "./work-types-shared.js";
 
 // Небольшой генератор CRUD-роутера для простых справочников вида
@@ -572,56 +573,28 @@ workTypesRouter.post(
 // Архивация вместо жёсткого удаления — record_items.work_type_id уже
 // использованных видов работ не должен терять связь со справочником.
 // Паттерн — прямая копия objectsRouter.patch("/:id/archive"...) выше.
-//
-// Для контейнеров дерева (level < 5) дополнительно запрещаем архивацию,
-// пока внутри (на любой глубине) остаются неархивные листья — иначе они
-// молча "пропадают" из каскада (родителя не найти через /tree), хотя сами
-// формально всё ещё активны.
+// Работает и для листьев, и для контейнеров дерева (level < 5 — см.
+// archiveWorkType: запрещает архивацию контейнера с неархивными листьями
+// внутри); только admin — для контейнеров есть также отдельный
+// PATCH /nodes/:id/archive (work-types-tree.js), доступный тоже только admin.
 workTypesRouter.patch(
   "/:id/archive",
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const { rows: beforeRows } = await pool.query(
-      `SELECT id, name, unit, price, status, archived_at, level FROM work_types WHERE id = $1`,
-      [req.params.id],
-    );
-    if (!beforeRows[0]) return res.status(404).json({ error: "not found" });
+    const result = await archiveWorkType(pool, req.params.id);
+    if (result.notFound) return res.status(404).json({ error: "not found" });
+    if (result.conflict) return res.status(409).json({ error: result.conflict });
 
-    if (beforeRows[0].level < 5) {
-      const { rows: activeLeafRows } = await pool.query(
-        `WITH RECURSIVE sub AS (
-           SELECT id FROM work_types WHERE id = $1
-           UNION ALL
-           SELECT wt.id FROM work_types wt JOIN sub ON wt.parent_id = sub.id
-         )
-         SELECT 1 FROM work_types
-          WHERE id IN (SELECT id FROM sub) AND id <> $1 AND level = 5 AND status <> 'archived'
-          LIMIT 1`,
-        [req.params.id],
-      );
-      if (activeLeafRows.length) {
-        return res.status(409).json({
-          error: "Внутри раздела есть неархивные виды работ — сначала заархивируйте их",
-        });
-      }
-    }
-
-    const { rows } = await pool.query(
-      `UPDATE work_types SET status = 'archived', archived_at = now()
-       WHERE id = $1
-       RETURNING id, name, unit, price, status, archived_at`,
-      [req.params.id],
-    );
     await insertAuditLog(pool, {
       entityType: "work_type",
-      entityId: rows[0].id,
+      entityId: result.after.id,
       action: "update",
       actorUserId: req.user.id,
       actorName: req.user.full_name,
-      before: beforeRows[0],
-      after: rows[0],
+      before: result.before,
+      after: result.after,
     });
-    res.json(rows[0]);
+    res.json(result.after);
   }),
 );
 
