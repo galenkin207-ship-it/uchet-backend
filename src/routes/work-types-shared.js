@@ -87,23 +87,115 @@ export async function checkGesnCodeUnique(executor, sbornikId, gesnCode, exclude
 }
 
 // Ошибки Postgres при записи в work_types → 400/409 с русским сообщением
-// вместо 500: 23502 (NOT NULL) и 23505 (unique). Возвращает true, если
-// ошибка обработана и ответ уже отправлен; иначе false — вызывающий
-// пробрасывает err дальше как раньше. Специфичные проверки (например,
+// вместо 500: 23502 (NOT NULL) и 23505 (unique). Возвращает { status, error }
+// или null, если ошибка не из этого списка — вызывающий пробрасывает err
+// дальше как раньше. Специфичные проверки (например,
 // idx_work_types_sbornik_gesn_code с текстом про код ГЭСН) вызывающий
 // делает ДО этого хелпера.
-export function respondWorkTypeDbError(err, res, { duplicateMessage }) {
+export function mapWorkTypeDbError(err, { duplicateMessage }) {
   if (err.code === "23502") {
     console.warn(`work_types: NOT NULL violation, column=${err.column}`);
-    res.status(400).json({ error: "Не заполнено обязательное поле" });
-    return true;
+    return { status: 400, error: "Не заполнено обязательное поле" };
   }
   if (err.code === "23505") {
     console.warn(`work_types: unique violation, constraint=${err.constraint}`);
-    res.status(409).json({ error: duplicateMessage });
-    return true;
+    return { status: 409, error: duplicateMessage };
   }
-  return false;
+  return null;
+}
+
+// Обёртка над mapWorkTypeDbError для обычных (не транзакционных) обработчиков:
+// true, если ошибка обработана и ответ уже отправлен.
+export function respondWorkTypeDbError(err, res, opts) {
+  const mapped = mapWorkTypeDbError(err, opts);
+  if (!mapped) return false;
+  res.status(mapped.status).json({ error: mapped.error });
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Создание листа (level=5) — общая логика POST /api/work-types (одиночное) и
+// POST /api/work-types/batch. Все хелперы возвращают { error: { status, error } }
+// вместо отправки ответа, чтобы batch мог откатить транзакцию и дописать номер
+// строки к сообщению.
+// ---------------------------------------------------------------------------
+
+// Обязательные поля листа: название, единица (NOT NULL в work_types — без неё
+// INSERT упал бы с 23502) и цена. Возвращает текст ошибки или null.
+export function validateLeafInput({ name, unit, price }) {
+  if (!name || !String(name).trim()) return "Укажите название";
+  if (unit == null || !String(unit).trim()) return "Укажите единицу измерения";
+  return validatePrice(price);
+}
+
+// Родитель будущего листа: существует, не архивный, не лист. forUpdate —
+// блокировка строки на время транзакции (batch: чтобы параллельные запросы
+// не проскочили между проверкой уникальности и вставкой).
+export async function loadLeafParent(executor, parentId, { forUpdate = false } = {}) {
+  const { rows } = await executor.query(
+    `SELECT id, level, status, sbornik_id, catalog_type FROM work_types WHERE id = $1${forUpdate ? " FOR UPDATE" : ""}`,
+    [parentId],
+  );
+  const parent = rows[0];
+  if (!parent) return { error: { status: 400, error: "Родительский узел не найден" } };
+  if (parent.status === "archived") return { error: { status: 400, error: "Родительский узел архивирован" } };
+  if (parent.level >= 5) return { error: { status: 400, error: "Родитель не может быть листом" } };
+  return { parent };
+}
+
+// Уникальность имени среди братьев и gesn_code в сборнике, затем INSERT листа
+// (level=5, source='manual', status='active'). fields.name/variant_label уже
+// финальные (name — итоговое имя листа). Возвращает { id } или { error }.
+export async function insertLeaf(executor, parent, fields) {
+  const { name, variant_label, unit, price, has_price, labor_hours, gesn_code, work_composition, sort_order } = fields;
+
+  const nameError = await checkNameUniqueAmongSiblings(executor, {
+    parentId: parent.id,
+    catalogType: parent.catalog_type,
+    name,
+    excludeId: null,
+  });
+  if (nameError) return { error: { status: 409, error: nameError } };
+
+  const sbornikId = parent.level === 1 ? parent.id : parent.sbornik_id;
+  const trimmedGesnCode = gesn_code != null && String(gesn_code).trim() ? String(gesn_code).trim() : null;
+
+  if (trimmedGesnCode) {
+    const gesnError = await checkGesnCodeUnique(executor, sbornikId, trimmedGesnCode, null);
+    if (gesnError) return { error: { status: 409, error: gesnError } };
+  }
+
+  try {
+    const { rows } = await executor.query(
+      `INSERT INTO work_types
+         (parent_id, level, catalog_type, sbornik_id, name, variant_label, unit, price, has_price,
+          labor_hours, gesn_code, work_composition, sort_order, source, status)
+       VALUES ($1,5,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'manual','active')
+       RETURNING id`,
+      [
+        parent.id,
+        parent.catalog_type,
+        sbornikId,
+        String(name).trim(),
+        variant_label || null,
+        String(unit).trim(),
+        price ?? 0,
+        has_price !== false,
+        labor_hours ?? null,
+        trimmedGesnCode,
+        work_composition || null,
+        sort_order ?? 0,
+      ],
+    );
+    return { id: rows[0].id };
+  } catch (err) {
+    if (err.code === "23505" && err.constraint === "idx_work_types_sbornik_gesn_code") {
+      return { error: { status: 409, error: `Код ГЭСН «${trimmedGesnCode}» уже используется в этом сборнике` } };
+    }
+    const mapped = mapWorkTypeDbError(err, { duplicateMessage: "Такая позиция уже есть" });
+    if (mapped) return { error: mapped };
+    throw err;
+  }
 }
 
 // Цепочка предков листа от корня (level 1) вниз, не включая сам лист.

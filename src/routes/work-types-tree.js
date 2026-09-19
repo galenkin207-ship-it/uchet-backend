@@ -11,6 +11,9 @@ import {
   buildLeafDetail,
   archiveWorkType,
   respondWorkTypeDbError,
+  validateLeafInput,
+  loadLeafParent,
+  insertLeaf,
 } from "./work-types-shared.js";
 
 // Роутер поверх древовидной структуры work_types (level, parent_id,
@@ -61,7 +64,9 @@ function normalizeForCompare(name) {
 // а отдаются с is_empty=true; has_children считается по любым неархивным
 // не-шаговым детям (листья или контейнеры, в том числе пустые).
 // containersOnly — только контейнеры (level<5), для селекторов «Расположение».
-async function fetchChildrenRows(where, params, { includeEmpty = false, containersOnly = false } = {}) {
+// level — только узлы с этим level (level — тип узла, не глубина: группа
+// level=4 может лежать прямо под сборником).
+async function fetchChildrenRows(where, params, { includeEmpty = false, containersOnly = false, level = null } = {}) {
   const hasChildrenCond = includeEmpty
     ? `TRUE`
     : `(
@@ -83,6 +88,8 @@ async function fetchChildrenRows(where, params, { includeEmpty = false, containe
             )) AS is_empty,`
     : "";
   const containersCond = containersOnly ? ` AND wt.level < 5` : "";
+  const queryParams = level == null ? params : [...params, level];
+  const levelCond = level == null ? "" : ` AND wt.level = $${queryParams.length}`;
   const { rows } = await pool.query(
     `WITH RECURSIVE leaf_ancestors AS (
        SELECT id AS leaf_id, parent_id AS ancestor_id
@@ -111,9 +118,9 @@ async function fetchChildrenRows(where, params, { includeEmpty = false, containe
             ) AS has_counter_steps
        FROM work_types wt
       WHERE ${where} AND wt.status <> 'archived' AND wt.is_step_item = false
-        AND ${visibleCond}${containersCond}
+        AND ${visibleCond}${containersCond}${levelCond}
       ORDER BY wt.sort_order, wt.name`,
-    params,
+    queryParams,
   );
   return rows;
 }
@@ -158,6 +165,9 @@ async function expandDuplicateGroups(parentId, parentNameStripped) {
 // с is_empty=true, has_children — по любым неархивным детям, а
 // expandDuplicateGroups не применяется (админ видит реальные узлы).
 // containers_only=1 — только контейнеры (level<5), для селекторов «Расположение».
+// level=<1..5> — только прямые дети с этим level (тип узла, не глубина); как и
+// include_empty/containers_only, отдаёт реальные узлы без схлопывания
+// одноимённых групп. Для корня (parentId не задан) level≠1 даёт пустой список.
 // Без параметров поведение прежнее (пикер записи, мобильная версия).
 workTypesTreeRouter.get(
   "/tree",
@@ -167,7 +177,14 @@ workTypesTreeRouter.get(
     const isTruthyFlag = (v) => v === "1" || v === "true";
     const includeEmpty = isTruthyFlag(req.query.include_empty) && req.user?.role === "admin";
     const containersOnly = isTruthyFlag(req.query.containers_only);
-    const treeOpts = { includeEmpty, containersOnly };
+    let level = null;
+    if (req.query.level !== undefined && req.query.level !== "") {
+      level = Number(req.query.level);
+      if (!Number.isInteger(level) || level < 1 || level > 5) {
+        return res.status(400).json({ error: "level должен быть целым числом от 1 до 5" });
+      }
+    }
+    const treeOpts = { includeEmpty, containersOnly, level };
 
     if (parentId === undefined || parentId === "") {
       if (!type) {
@@ -187,7 +204,7 @@ workTypesTreeRouter.get(
       return res.status(400).json({ error: "parentId должен быть целым числом" });
     }
 
-    if (includeEmpty || containersOnly) {
+    if (includeEmpty || containersOnly || level != null) {
       // Реальные узлы без схлопывания одноимённых групп (только для явно
       // запрошенных режимов; дефолтный путь ниже не меняется).
       const rows = await fetchChildrenRows("wt.parent_id = $1", [id], treeOpts);
@@ -580,15 +597,17 @@ workTypesTreeRouter.patch(
 
 // POST /nodes — создание узла-контейнера (level 1-4). parent_id === null/
 // отсутствует => создаётся корень (level=1), тогда catalog_type обязателен.
-// Иначе level = parent.level+1 (родитель обязан быть сам контейнером,
-// level 1-3 — контейнер level=4 дочерних контейнеров не имеет, только
-// листья level=5 через POST /api/work-types), sbornik_id/catalog_type
-// наследуются от родителя (catalog_type можно переопределить явно).
+// Иначе level по умолчанию parent.level+1; можно передать явно (level — тип
+// узла, а не глубина: группа level=4 может лежать прямо под сборником) —
+// тогда parent.level < level <= 4, иначе 400 «Недопустимый уровень».
+// Контейнер level=4 дочерних контейнеров не имеет, только листья level=5
+// (POST /api/work-types), sbornik_id/catalog_type наследуются от родителя
+// (catalog_type можно переопределить явно).
 workTypesTreeRouter.post(
   "/nodes",
   requireRole("admin"),
   asyncHandler(async (req, res) => {
-    const { parent_id, name, catalog_type, sort_order } = req.body || {};
+    const { parent_id, name, catalog_type, sort_order, level: levelRaw } = req.body || {};
     if (!name || !String(name).trim()) {
       return res.status(400).json({ error: "Укажите название" });
     }
@@ -615,7 +634,13 @@ workTypesTreeRouter.post(
       return res.status(400).json({ error: "Для корневого узла укажите catalog_type" });
     }
 
-    const level = parent ? parent.level + 1 : 1;
+    let level = parent ? parent.level + 1 : 1;
+    if (parent && levelRaw != null && levelRaw !== "") {
+      level = Number(levelRaw);
+      if (!Number.isInteger(level) || level <= parent.level || level > 4) {
+        return res.status(400).json({ error: "Недопустимый уровень" });
+      }
+    }
     const resolvedCatalogType = catalog_type || (parent ? parent.catalog_type : null);
 
     const nameError = await checkNameUniqueAmongSiblings(pool, {
@@ -682,6 +707,114 @@ workTypesTreeRouter.post(
     });
 
     res.status(201).json(node);
+  }),
+);
+
+// POST /batch — создание нескольких листьев (вариантов одной позиции) под
+// одним контейнером любого уровня 1-4 за один запрос: общее название (name) +
+// варианты. Итоговое имя листа = name + (variant_label ? " " + variant_label : "");
+// variant_label сохраняется отдельно. Валидации и вставка — тот же хелпер, что
+// у одиночного POST /api/work-types (insertLeaf), ошибки дополняются номером
+// строки («Строка N: ...»). Всё в одной транзакции: любая ошибка — ROLLBACK,
+// ничего не создаётся. Дубли внутри самого запроса ловятся теми же проверками
+// уникальности (они видят уже вставленные строки этой транзакции). Родитель
+// блокируется FOR UPDATE — параллельный запрос не проскочит между проверкой и
+// вставкой. Права как у одиночного создания листа: admin и curator.
+workTypesTreeRouter.post(
+  "/batch",
+  requireRole("admin", "curator"),
+  asyncHandler(async (req, res) => {
+    const { parent_id, name, work_composition, variants } = req.body || {};
+
+    const parentId = Number(parent_id);
+    if (parent_id == null || parent_id === "" || !Number.isInteger(parentId)) {
+      return res.status(400).json({ error: "parent_id обязателен и должен быть целым числом" });
+    }
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "Укажите название" });
+    }
+    if (!Array.isArray(variants) || variants.length === 0) {
+      return res.status(400).json({ error: "Укажите хотя бы один вариант" });
+    }
+    const baseName = String(name).trim();
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const { parent, error: parentError } = await loadLeafParent(client, parentId, { forUpdate: true });
+      if (parentError) {
+        await client.query("ROLLBACK");
+        return res.status(parentError.status).json({ error: parentError.error });
+      }
+
+      const createdIds = [];
+      for (let i = 0; i < variants.length; i += 1) {
+        const rowLabel = `Строка ${i + 1}`;
+        const variant = variants[i];
+        if (variant == null || typeof variant !== "object" || Array.isArray(variant)) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: `${rowLabel}: некорректный вариант` });
+        }
+        const { variant_label, unit, price, has_price, labor_hours, gesn_code, sort_order } = variant;
+
+        const label = variant_label != null && String(variant_label).trim() ? String(variant_label).trim() : null;
+        const leafName = label ? `${baseName} ${label}` : baseName;
+
+        const inputError = validateLeafInput({ name: leafName, unit, price });
+        if (inputError) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: `${rowLabel}: ${inputError}` });
+        }
+
+        const { id, error } = await insertLeaf(client, parent, {
+          name: leafName,
+          variant_label: label,
+          unit,
+          price,
+          has_price,
+          labor_hours,
+          gesn_code,
+          work_composition,
+          sort_order,
+        });
+        if (error) {
+          await client.query("ROLLBACK");
+          return res.status(error.status).json({ error: `${rowLabel}: ${error.error}` });
+        }
+        createdIds.push(id);
+
+        const detail = await buildLeafDetail(client, id);
+        await insertAuditLog(client, {
+          entityType: "work_type",
+          entityId: id,
+          action: "create",
+          actorUserId: req.user.id,
+          actorName: req.user.full_name,
+          before: null,
+          after: detail,
+        });
+      }
+
+      // Ответ — в формате /tree (TREE_COLUMNS + has_children/has_counter_steps/
+      // can_edit), в порядке создания. Свежесозданные листья заведомо без детей
+      // и без шагов-счётчиков — не через fetchChildrenRows.
+      const { rows } = await client.query(
+        `SELECT ${TREE_COLUMNS} FROM work_types WHERE id = ANY($1) ORDER BY id`,
+        [createdIds],
+      );
+      const items = rows.map((r) =>
+        annotateTreeItem({ ...r, has_children: false, has_counter_steps: false }, req.user),
+      );
+
+      await client.query("COMMIT");
+      res.status(201).json({ items });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
   }),
 );
 

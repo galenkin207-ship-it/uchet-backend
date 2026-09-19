@@ -7,11 +7,11 @@ import { loadRecordsByIds } from "./records.js";
 import {
   validatePrice,
   cascadeWorkTypeUpdate,
-  checkNameUniqueAmongSiblings,
-  checkGesnCodeUnique,
   buildLeafDetail,
   archiveWorkType,
-  respondWorkTypeDbError,
+  validateLeafInput,
+  loadLeafParent,
+  insertLeaf,
 } from "./work-types-shared.js";
 
 // Небольшой генератор CRUD-роутера для простых справочников вида
@@ -492,76 +492,26 @@ workTypesRouter.post(
     if (!Number.isInteger(parentId)) {
       return res.status(400).json({ error: "parent_id обязателен и должен быть целым числом" });
     }
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ error: "Укажите название" });
-    }
-    // unit — NOT NULL в work_types: без единицы INSERT упал бы с 23502.
-    if (unit == null || !String(unit).trim()) {
-      return res.status(400).json({ error: "Укажите единицу измерения" });
-    }
-    const priceError = validatePrice(price);
-    if (priceError) return res.status(400).json({ error: priceError });
+    const inputError = validateLeafInput({ name, unit, price });
+    if (inputError) return res.status(400).json({ error: inputError });
 
-    const { rows: parentRows } = await pool.query(
-      `SELECT id, level, status, sbornik_id, catalog_type FROM work_types WHERE id = $1`,
-      [parentId],
-    );
-    const parent = parentRows[0];
-    if (!parent) return res.status(400).json({ error: "Родительский узел не найден" });
-    if (parent.status === "archived") {
-      return res.status(400).json({ error: "Родительский узел архивирован" });
-    }
-    if (parent.level >= 5) {
-      return res.status(400).json({ error: "Родитель не может быть листом" });
-    }
+    const { parent, error: parentError } = await loadLeafParent(pool, parentId);
+    if (parentError) return res.status(parentError.status).json({ error: parentError.error });
 
-    const nameError = await checkNameUniqueAmongSiblings(pool, {
-      parentId: parent.id,
-      catalogType: parent.catalog_type,
+    // Проверки уникальности имени/gesn_code и сам INSERT — общий хелпер
+    // insertLeaf (его же использует POST /batch в work-types-tree.js).
+    const { id: newId, error: insertError } = await insertLeaf(pool, parent, {
       name,
-      excludeId: null,
+      variant_label,
+      unit,
+      price,
+      has_price,
+      labor_hours,
+      gesn_code,
+      work_composition,
+      sort_order,
     });
-    if (nameError) return res.status(409).json({ error: nameError });
-
-    const sbornikId = parent.level === 1 ? parent.id : parent.sbornik_id;
-    const trimmedGesnCode = gesn_code != null && String(gesn_code).trim() ? String(gesn_code).trim() : null;
-
-    if (trimmedGesnCode) {
-      const gesnError = await checkGesnCodeUnique(pool, sbornikId, trimmedGesnCode, null);
-      if (gesnError) return res.status(409).json({ error: gesnError });
-    }
-
-    let newId;
-    try {
-      const { rows } = await pool.query(
-        `INSERT INTO work_types
-           (parent_id, level, catalog_type, sbornik_id, name, variant_label, unit, price, has_price,
-            labor_hours, gesn_code, work_composition, sort_order, source, status)
-         VALUES ($1,5,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'manual','active')
-         RETURNING id`,
-        [
-          parent.id,
-          parent.catalog_type,
-          sbornikId,
-          String(name).trim(),
-          variant_label || null,
-          String(unit).trim(),
-          price ?? 0,
-          has_price !== false,
-          labor_hours ?? null,
-          trimmedGesnCode,
-          work_composition || null,
-          sort_order ?? 0,
-        ],
-      );
-      newId = rows[0].id;
-    } catch (err) {
-      if (err.code === "23505" && err.constraint === "idx_work_types_sbornik_gesn_code") {
-        return res.status(409).json({ error: `Код ГЭСН «${trimmedGesnCode}» уже используется в этом сборнике` });
-      }
-      if (respondWorkTypeDbError(err, res, { duplicateMessage: "Такая позиция уже есть" })) return;
-      throw err;
-    }
+    if (insertError) return res.status(insertError.status).json({ error: insertError.error });
 
     const detail = await buildLeafDetail(pool, newId);
     await insertAuditLog(pool, {
