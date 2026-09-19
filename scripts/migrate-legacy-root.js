@@ -63,6 +63,27 @@ const PLAN_CSV_PATH = "/tmp/legacy_plan.csv";
 const PLAN_JSON_PATH = "/tmp/legacy_plan.json";
 const OVERRIDES_FILE = fileURLToPath(new URL("./data/legacy_overrides.json", import.meta.url));
 
+// Тот же дефолт, что и src/db.js — используется как "origin" плана
+// (записывается в plan.json), чтобы --apply мог отказаться применить план
+// staging на проде или наоборот (см. main()).
+function resolveDbName() {
+  return process.env.DB_NAME || "uchet_db";
+}
+
+// dry-run переписывает эти файлы только при УСПЕШНОМ построении плана —
+// если buildPlan() бросает исключение (например, двойное занятие копии),
+// свежий прогон не должен оставить после себя ни старые (устаревшие), ни
+// частично записанные файлы, которые можно принять за актуальный план.
+function removeStalePlanFiles() {
+  for (const p of [PLAN_CSV_PATH, PLAN_JSON_PATH]) {
+    try {
+      fs.unlinkSync(p);
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+    }
+  }
+}
+
 // Порог для гипотезы "old_n старой строки равен legacy_num её копии"
 // (см. testTierKHypothesis). На staging гипотеза НЕ подтвердилась (8 из
 // 773) — с 90%-порогом tier K там автоматически отключён. Порог, а не
@@ -145,6 +166,7 @@ function parseArgs() {
     apply: rest.includes("--apply"),
     confirm: rest.includes("--confirm"),
     planPath: getOpt("--plan"),
+    selfTest: rest.includes("--self-test"),
   };
 }
 
@@ -211,13 +233,18 @@ async function loadArchivedLegacyCount(client, rootId) {
 // Предки копии (level 1-4, сколько бы их реально ни было — parent_id может
 // вести напрямую к level 1-3, см. work-types-tree.js) — тот же паттерн
 // рекурсивного подъёма, что и getAncestorChain в src/routes/work-types-shared.js.
+// Любой статус (не только active) — см. loadCopyRows: place_next_to должен
+// уметь резолвить якорь, даже если он уже архивен (до начала работы скрипта,
+// или архивируется другой строкой ЭТОГО ЖЕ плана — place_next_to читает у
+// копии только parent_id/catalog_type/sbornik_id, которые архивация не
+// трогает, см. buildPlan/applyOverrides).
 async function loadCopyAncestors(client) {
   const { rows } = await client.query(
     `WITH RECURSIVE anc AS (
        SELECT leaf.id AS leaf_id, p.id, p.parent_id, p.level, p.name
          FROM work_types leaf
          JOIN work_types p ON p.id = leaf.parent_id
-        WHERE leaf.source = 'user_added' AND leaf.legacy_num IS NOT NULL AND leaf.status = 'active'
+        WHERE leaf.source = 'user_added' AND leaf.legacy_num IS NOT NULL
        UNION ALL
        SELECT a.leaf_id, p2.id, p2.parent_id, p2.level, p2.name
          FROM anc a
@@ -233,17 +260,21 @@ async function loadCopyAncestors(client) {
   return byLeaf;
 }
 
+// Загружает ВСЕ user_added-копии (любой status — active и archived), с
+// полем status в результате. Вызывающий код сам решает, кому нужен только
+// active-подмножество (T1-T5/tier K/match_copy — резолв в РЕАЛЬНО свободный,
+// не архивный слот) и кому годится любой статус (place_next_to — см. выше).
 async function loadCopyRows(client) {
   const { rows } = await client.query(
     `SELECT u.id, u.legacy_num, u.name, u.unit, u.price, u.parent_id, u.sbornik_id, u.catalog_type,
-            u.sort_order, u.variant_label, p.name AS parent_name,
+            u.sort_order, u.variant_label, u.status, p.name AS parent_name,
             COALESCE(ri.cnt, 0)::int AS record_items_count
        FROM work_types u
        LEFT JOIN work_types p ON p.id = u.parent_id
        LEFT JOIN (
          SELECT work_type_id, count(*) AS cnt FROM record_items GROUP BY work_type_id
        ) ri ON ri.work_type_id = u.id
-      WHERE u.source = 'user_added' AND u.legacy_num IS NOT NULL AND u.status = 'active'
+      WHERE u.source = 'user_added' AND u.legacy_num IS NOT NULL
       ORDER BY u.id`,
   );
   const ancestorsByLeaf = await loadCopyAncestors(client);
@@ -275,6 +306,7 @@ async function loadCopyRows(client) {
       catalogType: r.catalog_type,
       sortOrder: r.sort_order,
       variantLabel: r.variant_label,
+      status: r.status,
       parentName: r.parent_name,
       recordItemsCount: r.record_items_count,
       nameNorm: normalizeName(r.name),
@@ -514,6 +546,12 @@ const ROW_DEFAULTS = {
   override_unit: null,
   override_price: null,
   override_key: null,
+  // Заморожены при построении плана для place_next_to (см.
+  // buildOverridePlaceNextToRow) — apply использует их как есть, не
+  // резолвит копию заново.
+  anchor_parent_id: null,
+  anchor_catalog_type: null,
+  anchor_sbornik_id: null,
 };
 
 function buildRowFromMatch(m) {
@@ -634,7 +672,7 @@ function buildOverrideErrorRow(ov, message, legacyRow, overrideKey) {
 
 function buildOverrideCopyAmbiguousRow(legacyRow, ov, candidates, overrideKey) {
   const list = candidates.length
-    ? candidates.map((c) => `id=${c.id} legacy_num=${c.legacyNum} "${c.path}"`).join(" | ")
+    ? candidates.map((c) => `id=${c.id} legacy_num=${c.legacyNum} status=${c.status} "${c.path}"`).join(" | ")
     : "(ничего не найдено)";
   return {
     ...baseOverrideFields(legacyRow),
@@ -705,7 +743,18 @@ function buildOverrideMatchCopyRow(legacyRow, copy, ov, overrideKey) {
   };
 }
 
+// Якорь place_next_to резолвится и его parent_id/catalog_type/sbornik_id
+// читаются ОДИН РАЗ здесь, при построении плана, и замораживаются в строку
+// плана (anchor_*) — эти три поля не меняются архивацией строки, поэтому не
+// нужно (и вредно, см. заголовок файла) перерезолвливать копию заново на
+// --apply: там используются anchor_* как есть, без обращения к текущему
+// статусу/данным копии.
 function buildOverridePlaceNextToRow(legacyRow, copy, ov, overrideKey) {
+  const archivedWarning =
+    copy.status === "archived"
+      ? ` [копия-якорь уже архивна на момент построения плана (не этим планом — см. заголовок файла); ` +
+        `используются её сохранённые parent_id=${copy.parentId}/catalog_type/sbornik_id]`
+      : "";
   return {
     ...baseOverrideFields(legacyRow),
     copy_id: copy.id,
@@ -716,28 +765,42 @@ function buildOverridePlaceNextToRow(legacyRow, copy, ov, overrideKey) {
     diff_flags: computeDiffFlags(legacyRow, copy),
     action: "place_next_to",
     notes:
-      `override place_next_to: "${ov.copy_name}" (parent_id/catalog_type/sbornik_id копии, ` +
-      `sort_order = max+1, variant_label=NULL, своё имя и unit/price сохраняются, копия не архивируется)`,
+      `override place_next_to: "${ov.copy_name}" (parent_id/catalog_type/sbornik_id копии — снимок на момент ` +
+      `построения плана, sort_order = max+1 (пересчитывается заново на apply), variant_label=NULL, своё имя и ` +
+      `unit/price сохраняются, копия не архивируется)${archivedWarning}`,
     override_unit: ov.set_unit ?? null,
     override_price: ov.set_price ?? null,
     override_key: overrideKey,
+    anchor_parent_id: copy.parentId,
+    anchor_catalog_type: copy.catalogType,
+    anchor_sbornik_id: copy.sbornikId,
   };
 }
 
 // Полные поправки (с action) — вынимают строку из обычного пайплайна ДО
 // tier K/дублей/T1-T5. Возвращает { rows, remainingLegacyRows } — вторые
 // идут дальше в обычное сопоставление.
-async function applyOverrides(client, fullOverrides, legacyRows, copies) {
+async function applyOverrides(client, fullOverrides, legacyRows, copies, allCopies) {
   const byOldN = new Map(legacyRows.map((r) => [r.oldN, r]));
   const byNameNorm = new Map();
   for (const r of legacyRows) {
     if (!byNameNorm.has(r.nameNorm)) byNameNorm.set(r.nameNorm, []);
     byNameNorm.get(r.nameNorm).push(r);
   }
+  // match_copy резолвится ТОЛЬКО среди active — сама архивирует копию, в
+  // архивный слот "заходить" бессмысленно. place_next_to — среди ЛЮБОГО
+  // статуса (allCopies) — копия остаётся на месте, читаются только её
+  // parent_id/catalog_type/sbornik_id (не меняются архивацией), см.
+  // buildOverridePlaceNextToRow.
   const copiesByNameNorm = new Map();
   for (const c of copies) {
     if (!copiesByNameNorm.has(c.nameNorm)) copiesByNameNorm.set(c.nameNorm, []);
     copiesByNameNorm.get(c.nameNorm).push(c);
+  }
+  const anyStatusCopiesByNameNorm = new Map();
+  for (const c of allCopies) {
+    if (!anyStatusCopiesByNameNorm.has(c.nameNorm)) anyStatusCopiesByNameNorm.set(c.nameNorm, []);
+    anyStatusCopiesByNameNorm.get(c.nameNorm).push(c);
   }
 
   // Две строки поправок с одним и тем же old_n — почти наверняка ошибка
@@ -799,9 +862,9 @@ async function applyOverrides(client, fullOverrides, legacyRows, copies) {
       continue;
     }
 
-    if (ov.action === "match_copy" || ov.action === "place_next_to") {
+    if (ov.action === "match_copy") {
       if (!ov.copy_name) {
-        rows.push(buildOverrideErrorRow(ov, `action=${ov.action} требует copy_name`, legacyRow, overrideKey));
+        rows.push(buildOverrideErrorRow(ov, `action=match_copy требует copy_name`, legacyRow, overrideKey));
         continue;
       }
       const norm = normalizeName(ov.copy_name);
@@ -810,12 +873,35 @@ async function applyOverrides(client, fullOverrides, legacyRows, copies) {
         rows.push(buildOverrideCopyAmbiguousRow(legacyRow, ov, candidates, overrideKey));
         continue;
       }
+      rows.push(buildOverrideMatchCopyRow(legacyRow, candidates[0], ov, overrideKey));
+      continue;
+    }
+
+    if (ov.action === "place_next_to") {
+      if (!ov.copy_name) {
+        rows.push(buildOverrideErrorRow(ov, `action=place_next_to требует copy_name`, legacyRow, overrideKey));
+        continue;
+      }
+      const norm = normalizeName(ov.copy_name);
+      const candidates = anyStatusCopiesByNameNorm.get(norm) ?? [];
+      if (candidates.length !== 1) {
+        rows.push(buildOverrideCopyAmbiguousRow(legacyRow, ov, candidates, overrideKey));
+        continue;
+      }
       const copy = candidates[0];
-      rows.push(
-        ov.action === "match_copy"
-          ? buildOverrideMatchCopyRow(legacyRow, copy, ov, overrideKey)
-          : buildOverridePlaceNextToRow(legacyRow, copy, ov, overrideKey),
-      );
+      if (copy.status === "archived" && copy.parentId == null) {
+        rows.push(
+          buildOverrideErrorRow(
+            ov,
+            `копия-якорь "${ov.copy_name}" (legacy_num=${copy.legacyNum}) архивна и без parent_id ` +
+              `(родитель, видимо, удалён) — разместить рядом с ней невозможно`,
+            legacyRow,
+            overrideKey,
+          ),
+        );
+        continue;
+      }
+      rows.push(buildOverridePlaceNextToRow(legacyRow, copy, ov, overrideKey));
       continue;
     }
 
@@ -890,18 +976,17 @@ function findDoubleClaimConflicts(rows) {
       for (const t of row.twin_copy_legacy_nums ?? []) addClaim(t, row);
     }
   }
-
+  // place_next_to НЕ архивирует и не "занимает" копию — она лишь читает
+  // parent_id/catalog_type/sbornik_id снимком при построении плана
+  // (buildOverridePlaceNextToRow) и на --apply использует этот снимок, не
+  // обращаясь к текущему состоянию копии вовсе (см. resolvePlanRow/
+  // runApply). Поэтому place_next_to принципиально не может участвовать в
+  // двойном занятии — ни с другим place_next_to на ту же копию (оба законно
+  // становятся её соседями), ни с move/match_copy/twins, которые эту же
+  // копию архивируют (архивация не трогает читаемые place_next_to поля).
   const conflicts = [];
   for (const [legacyNum, claimants] of claims) {
     if (claimants.length > 1) conflicts.push({ copyLegacyNum: legacyNum, claimants });
-  }
-
-  for (const row of rows) {
-    if (row.action !== "place_next_to") continue;
-    const claimants = claims.get(row.copy_legacy_num);
-    if (claimants && claimants.length) {
-      conflicts.push({ copyLegacyNum: row.copy_legacy_num, claimants: [row, ...claimants], placeNextTo: true });
-    }
   }
   return conflicts;
 }
@@ -912,10 +997,79 @@ function describeDoubleClaimConflicts(conflicts) {
       const rowsDesc = c.claimants
         .map((r) => `legacy_id=${r.legacy_id} old_n=${r.old_n} action=${r.action} "${r.legacy_name}"`)
         .join(" И ");
-      const kind = c.placeNextTo ? " (place_next_to рядом с копией, которую архивирует другая строка)" : "";
-      return `  copy_legacy_num=${c.copyLegacyNum}${kind}: ${rowsDesc}`;
+      return `  copy_legacy_num=${c.copyLegacyNum}: ${rowsDesc}`;
     })
     .join("\n");
+}
+
+// node scripts/migrate-legacy-root.js --self-test — проверяет
+// findDoubleClaimConflicts на фикстурах, без БД (нет ни pool.connect(), ни
+// чтения .env) — можно гонять локально/в CI до всякого доступа к серверу.
+// Минимальные строки-фикстуры содержат только поля, которые реально читает
+// findDoubleClaimConflicts (action/copy_legacy_num/twin_copy_legacy_nums) +
+// то, что использует describeDoubleClaimConflicts для сообщения об ошибке.
+function selfTestRow(legacyId, action, copyLegacyNum, twins = []) {
+  return {
+    legacy_id: legacyId,
+    old_n: legacyId,
+    legacy_name: `тест-${legacyId}`,
+    action,
+    copy_legacy_num: copyLegacyNum,
+    twin_copy_legacy_nums: twins,
+  };
+}
+
+function runSelfTest() {
+  const cases = [
+    {
+      name: "place_next_to + move на одну копию → OK (place_next_to не участвует в занятии копии)",
+      rows: [selfTestRow(1, "place_next_to", 100), selfTestRow(2, "move", 100)],
+      expectConflicts: 0,
+    },
+    {
+      name: "два move на одну копию → ошибка",
+      rows: [selfTestRow(3, "move", 200), selfTestRow(4, "move", 200)],
+      expectConflicts: 1,
+    },
+    {
+      name: "match_copy + move на одну копию → ошибка",
+      rows: [selfTestRow(5, "match_copy", 300), selfTestRow(6, "move", 300)],
+      expectConflicts: 1,
+    },
+    {
+      name: "две place_next_to на одну копию → OK (обе законно становятся соседями)",
+      rows: [selfTestRow(7, "place_next_to", 400), selfTestRow(8, "place_next_to", 400)],
+      expectConflicts: 0,
+    },
+    // Дополнительно (не из ТЗ, но напрашивается): близнец move_and_archive_twins
+    // конфликтует с move на ту же копию — twin_copy_legacy_nums тоже должны
+    // проверяться, не только основной copy_legacy_num строки.
+    {
+      name: "move_and_archive_twins (близнец=500) + move на копию 500 → ошибка",
+      rows: [selfTestRow(9, "move_and_archive_twins", 600, [500]), selfTestRow(10, "move", 500)],
+      expectConflicts: 1,
+    },
+  ];
+
+  let failed = 0;
+  for (const c of cases) {
+    const conflicts = findDoubleClaimConflicts(c.rows);
+    const ok = conflicts.length === c.expectConflicts;
+    console.log(
+      `${ok ? "OK  " : "FAIL"} ${c.name} (ожидалось конфликтов: ${c.expectConflicts}, получено: ${conflicts.length})`,
+    );
+    if (!ok) {
+      failed++;
+      if (conflicts.length) console.log(describeDoubleClaimConflicts(conflicts));
+    }
+  }
+
+  if (failed) {
+    console.error(`\nСамотест провален: ${failed} из ${cases.length}.`);
+    process.exitCode = 1;
+  } else {
+    console.log(`\nСамотест пройден: ${cases.length} из ${cases.length}.`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -937,11 +1091,20 @@ export async function buildPlan(client) {
   const root = await loadRoot(client);
   const legacyRows = await loadLegacyRows(client, root.id);
   const archivedCount = await loadArchivedLegacyCount(client, root.id);
-  const copies = await loadCopyRows(client);
+  // allCopies — любой статус (нужен place_next_to, см. loadCopyRows); copies —
+  // только active, для T1-T5/tier K/match_copy (резолв в реально свободный слот).
+  const allCopies = await loadCopyRows(client);
+  const copies = allCopies.filter((c) => c.status === "active");
   const indices = buildCopyIndices(copies);
 
   const { fullOverrides, adjustments } = loadOverridesFile();
-  const { rows: overrideRows, remainingLegacyRows } = await applyOverrides(client, fullOverrides, legacyRows, copies);
+  const { rows: overrideRows, remainingLegacyRows } = await applyOverrides(
+    client,
+    fullOverrides,
+    legacyRows,
+    copies,
+    allCopies,
+  );
 
   const tierK = testTierKHypothesis(remainingLegacyRows, indices);
 
@@ -1177,6 +1340,7 @@ function writePlanJson(plan, path) {
   }
   const payload = {
     generatedAt: plan.generatedAt,
+    dbName: resolveDbName(),
     rootId: plan.rootId,
     tierKEnabled: plan.tierK.enabled,
     tierKRatio: plan.tierK.ratio,
@@ -1260,11 +1424,21 @@ async function resolvePlanRow(client, row) {
     return { row, kind: "twins", legacy, primary, twins };
   }
   if (row.action === "place_next_to") {
+    // Копия НЕ резолвится заново — parent_id/catalog_type/sbornik_id
+    // заморожены в плане при его построении (anchor_*, см.
+    // buildOverridePlaceNextToRow); обращаться к текущему состоянию копии
+    // здесь не нужно и вредно (архивация другой строкой в этом же apply не
+    // должна влиять на place_next_to, см. заголовок файла).
     const legacy = await resolveLegacyRow(client, { oldN: row.old_n, name: row.legacy_name, unit: row.legacy_unit });
     if (legacy.error) return { row, kind: "place_next_to", error: legacy.error };
-    const copy = await resolveCopyByLegacyNum(client, row.copy_legacy_num);
-    if (copy.error) return { row, kind: "place_next_to", error: copy.error };
-    return { row, kind: "place_next_to", legacy, copy };
+    if (row.anchor_parent_id == null) {
+      return {
+        row,
+        kind: "place_next_to",
+        error: "в плане нет anchor_parent_id для place_next_to (план сгенерирован старой версией скрипта?)",
+      };
+    }
+    return { row, kind: "place_next_to", legacy };
   }
   if (row.action === "archive") {
     const legacy = await resolveLegacyRow(client, { oldN: row.old_n, name: row.legacy_name, unit: row.legacy_unit });
@@ -1293,16 +1467,6 @@ async function previewApply(client, plan) {
     const resolved = await resolvePlanRow(client, row);
     if (resolved.error) {
       errors.push({ row, error: resolved.error });
-      continue;
-    }
-    // Тот же анти-double-claim бэкстоп, что и в runApply: place_next_to,
-    // чья копия уже архивирована кем-то другим, не должен молча числиться
-    // "готов к переносу".
-    if (resolved.kind === "place_next_to" && resolved.legacy.parent_id === plan.rootId && resolved.copy.status === "archived") {
-      errors.push({
-        row,
-        error: `копия legacy_num=${row.copy_legacy_num} уже архивирована (занята другим действием) — place_next_to невозможен`,
-      });
       continue;
     }
     byKind[resolved.kind].push(resolved);
@@ -1401,40 +1565,28 @@ async function runApply(client, plan) {
         }
         counters.twinsMoved++;
       } else if (resolved.kind === "place_next_to") {
-        const { legacy, copy } = resolved;
+        const { legacy } = resolved;
         if (legacy.parent_id !== plan.rootId) {
           // Единственный способ, которым legacy-строка теряет parent_id=root, —
-          // это уже выполненный шаг этого скрипта (move/match_copy/twins/
-          // place_next_to/archive/delete_if_unreferenced) — копия для
-          // place_next_to никогда не архивируется, поэтому её статус не
-          // годится как признак идемпотентности.
+          // это уже выполненный шаг этого скрипта — копия для place_next_to
+          // никогда не архивируется и вообще не резолвится заново здесь
+          // (используется снимок row.anchor_*, см. resolvePlanRow), поэтому
+          // это единственный и достаточный признак идемпотентности.
           counters.alreadyDone++;
           continue;
         }
-        if (copy.status === "archived") {
-          // Строка ещё под корнем (не идемпотентный случай выше), но её
-          // копия уже архивирована — кто-то ДРУГОЙ её забрал (move/
-          // match_copy/twins). findDoubleClaimConflicts должен был поймать
-          // это ещё на этапе построения плана — если всё же долетело сюда
-          // (план правили руками, или БД изменилась между dry-run и apply),
-          // не молчим: считаем нерезолвленной строкой, а не тихо пропускаем.
-          counters.unresolved++;
-          unresolvedRows.push({
-            row,
-            error: `копия legacy_num=${row.copy_legacy_num} уже архивирована (занята другим действием) — ` +
-              `place_next_to рядом с ней невозможен`,
-          });
-          continue;
-        }
+        // sort_order — единственное поле, которое НЕ заморожено в плане:
+        // пересчитывается заново от текущих соседей под anchor_parent_id
+        // (могли появиться новые с момента dry-run).
         const { rows: maxRows } = await client.query(
           `SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM work_types WHERE parent_id = $1`,
-          [copy.parent_id],
+          [row.anchor_parent_id],
         );
         const setParts = [
           "parent_id = $1", "level = 5", "catalog_type = $2", "sbornik_id = $3",
           "sort_order = $4", "variant_label = NULL",
         ];
-        const values = [copy.parent_id, copy.catalog_type, copy.sbornik_id, maxRows[0].next];
+        const values = [row.anchor_parent_id, row.anchor_catalog_type, row.anchor_sbornik_id, maxRows[0].next];
         let idx = values.length + 1;
         if (row.override_unit != null) { setParts.push(`unit = $${idx}`); values.push(row.override_unit); idx++; }
         if (row.override_price != null) { setParts.push(`price = $${idx}`); values.push(row.override_price); idx++; }
@@ -1559,9 +1711,19 @@ function printApplyCounters(counters, unresolvedRows) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { apply, confirm, planPath } = parseArgs();
+  const { apply, confirm, planPath, selfTest } = parseArgs();
+
+  if (selfTest) {
+    runSelfTest();
+    return;
+  }
 
   if (!apply) {
+    // Убираем старые файлы ДО построения плана — если buildPlan() бросит
+    // исключение (например, двойное занятие копии), на диске не должно
+    // остаться ни старого, ни полу-записанного плана, который можно
+    // спутать со свежим (см. removeStalePlanFiles).
+    removeStalePlanFiles();
     const client = await pool.connect();
     try {
       const plan = await buildPlan(client);
@@ -1580,6 +1742,31 @@ async function main() {
     return;
   }
   const plan = loadPlanFile(planPath);
+
+  // Origin-проверка: план должен быть построен ИМЕННО для той БД, к которой
+  // подключится этот прогон (.env в текущей директории) — иначе staging
+  // легко спутать с прод и наоборот (id разные, но dbName должен различаться
+  // всегда, т.к. .env.example требует явно задавать DB_NAME). Планы старых
+  // версий скрипта (без dbName) тоже отклоняются — пересоздайте --dry-run.
+  const currentDbName = resolveDbName();
+  if (!plan.dbName) {
+    console.error(
+      "В plan.json нет поля dbName (план сгенерирован более старой версией скрипта) — " +
+        "пересоздайте его свежим --dry-run на целевом окружении, прежде чем применять.",
+    );
+    process.exitCode = 1;
+    return;
+  }
+  if (plan.dbName !== currentDbName) {
+    console.error(
+      `План построен для БД "${plan.dbName}", а текущее подключение (.env в этой директории) — ` +
+        `"${currentDbName}". Похоже, план сгенерирован на другом окружении (staging/прод перепутаны) — ` +
+        `apply остановлен, БД не тронута.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`План: dbName="${plan.dbName}", построен ${plan.generatedAt}.`);
 
   // Та же проверка двойного занятия копии, что и при построении плана
   // (buildPlan) — перевалидируем здесь на случай, если plan.json правили
@@ -1639,10 +1826,18 @@ if (isMainModule) {
  *   - с action: match_copy | place_next_to | archive | delete_if_unreferenced
  *     — { old_n?, name?, action, copy_name?, set_unit?, set_price? };
  *     адресация legacy-строки — old_n, иначе точное совпадение name;
- *     адресация копии (match_copy/place_next_to) — copy_name (точное
- *     нормализованное совпадение среди активных source='user_added'; 0 или
+ *     адресация копии — copy_name (точное нормализованное совпадение; 0 или
  *     >1 совпадений — строка попадает в отчёт как override_unresolved со
  *     списком найденных вариантов, ничего не выбирается автоматически).
+ *     match_copy ищет копию ТОЛЬКО среди active (сама архивирует её —
+ *     в архивный слот "заходить" бессмысленно). place_next_to ищет среди
+ *     ЛЮБОГО статуса (active и archived) и читает parent_id/catalog_type/
+ *     sbornik_id копии ОДИН РАЗ при построении плана — эти поля не меняются
+ *     архивацией, поэтому дальше place_next_to от статуса копии не зависит
+ *     вообще (см. правило про двойное занятие ниже); если найденная копия
+ *     уже архивна на момент построения плана и у неё нет parent_id — это
+ *     единственный случай, когда place_next_to всё же падает в
+ *     override_unresolved (разместить рядом буквально не с чем).
  *   - без action: { old_n, set_unit?, set_price? } — поправка ПОВЕРХ
  *     результата обычного автосопоставления (ожидается action=move/
  *     match_copy/move_and_archive_twins); если строка свелась к чему-то
@@ -1664,26 +1859,38 @@ if (isMainModule) {
  * состояние на момент apply — между запусками БД может измениться).
  *
  * Идемпотентность --apply --confirm: каждая строка резолвится заново по
- * old_n/legacy_num. Признак "уже сделано в прошлый прогон" — свой для
- * каждого действия: для move/match_copy/слота близнецов — копия уже
- * archived; для place_next_to (копия НЕ архивируется) — parent_id
- * legacy-строки уже не равен id корня; для archive/delete_if_unreferenced —
- * сама строка уже archived; для merge_into_winner — проигравший уже
- * archived. Строки, которые не удалось резолвить, пропускаются с
- * сообщением, не обрывая транзакцию целиком.
+ * old_n/legacy_num — КРОМЕ place_next_to, которая копию вообще не
+ * резолвит повторно (см. ниже). Признак "уже сделано в прошлый прогон" —
+ * свой для каждого действия: для move/match_copy/слота близнецов — копия
+ * уже archived; для place_next_to — parent_id legacy-строки уже не равен id
+ * корня (единственный и достаточный признак — см. ниже, почему статус
+ * копии тут ни при чём); для archive/delete_if_unreferenced — сама строка
+ * уже archived; для merge_into_winner — проигравший уже archived. Строки,
+ * которые не удалось резолвить, пропускаются с сообщением, не обрывая
+ * транзакцию целиком.
  *
  * Двойное занятие копии (findDoubleClaimConflicts): проверяется ПОСЛЕ
  * сборки плана — и в --dry-run (buildPlan бросает исключение, CSV/JSON не
- * пишутся), и заново в --apply (main() проверяет уже загруженный plan.json
- * перед BEGIN — на случай ручной правки файла или более старого dry-run).
- * Одна копия (по copy_legacy_num) не может архивироваться двумя разными
- * строками (move/match_copy/twins, включая каждого близнеца); place_next_to
- * сам по себе не конфликтует с другим place_next_to на ту же копию (копия
- * не архивируется), но конфликтует, если та же копия архивируется где-то
- * ещё. При --apply --confirm есть и дублирующий бэкстоп на исполнении: если
- * place_next_to всё же наткнулся на уже архивированную копию (план поменяли
- * руками, или БД успела измениться) — строка не архивируется молча как
- * "уже сделано", а попадает в нерезолвленные с явной причиной.
+ * пишутся, а перед построением плана старые CSV/JSON вообще удаляются, см.
+ * removeStalePlanFiles — свежий прогон не должен оставить после себя ничего,
+ * что можно принять за актуальный план), и заново в --apply (main()
+ * проверяет уже загруженный plan.json перед BEGIN — на случай ручной правки
+ * файла или более старого dry-run). Одна копия (по copy_legacy_num) не
+ * может архивироваться двумя разными строками (move/match_copy/twins,
+ * включая каждого близнеца) — это единственная проверка, place_next_to в
+ * ней НЕ участвует вообще: она не архивирует копию и читает только
+ * parent_id/catalog_type/sbornik_id (не меняются архивацией) ОДИН РАЗ при
+ * построении плана, замораживая их в саму строку плана (anchor_parent_id/
+ * anchor_catalog_type/anchor_sbornik_id, см. buildOverridePlaceNextToRow) —
+ * на --apply используются эти замороженные значения напрямую, копия не
+ * резолвится заново ни по имени, ни по legacy_num, и её текущий статус
+ * (архивирована ли она к этому моменту другой строкой того же плана) роли
+ * не играет. (Раньше здесь была ошибочная перекрёстная проверка
+ * place_next_to против move/match_copy/twins — она давала ложные
+ * срабатывания именно в этом законном случае и была убрана.)
+ *
+ * Самотест без БД: node scripts/migrate-legacy-root.js --self-test —
+ * проверяет findDoubleClaimConflicts на фикстурах (без pool.connect()).
  *
  * Финальная проверка --apply --confirm: в конце (до COMMIT) считаются живые
  * legacy-строки, оставшиеся под корнем. По замыслу их должно быть 0 (все,
@@ -1694,6 +1901,15 @@ if (isMainModule) {
  * коммитится, даже успешно обработанные строки этого прогона), список
  * оставшихся строк (id/old_n/name) печатается, а сам скрипт завершается с
  * process.exitCode=1.
+ *
+ * Origin-проверка --apply: plan.json несёт dbName (то же значение, что и
+ * process.env.DB_NAME || "uchet_db" на момент dry-run) и generatedAt. Перед
+ * любым обращением к БД --apply сверяет dbName плана с dbName текущего
+ * подключения (.env в текущей директории) — несовпадение (или отсутствие
+ * dbName — план от старой версии скрипта) останавливает apply без единого
+ * запроса к БД. Это защита именно от "применили план staging на проде (или
+ * наоборот)", а не от давности плана самой по себе — generatedAt печатается
+ * для информации, но не проверяется на "свежесть" по таймауту.
  *
  * Что скрипт НЕ трогает: legacy_root (сам корень), 3 архивные legacy-строки
  * (загружаются только status='active'), is_step_item/is_counter_step/
