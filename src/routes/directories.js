@@ -4,6 +4,13 @@ import { requireAuth, requireRole } from "../auth.js";
 import { insertAuditLog } from "../audit.js";
 import { asyncHandler } from "../async-handler.js";
 import { loadRecordsByIds } from "./records.js";
+import {
+  validatePrice,
+  cascadeWorkTypeUpdate,
+  checkNameUniqueAmongSiblings,
+  checkGesnCodeUnique,
+  buildLeafDetail,
+} from "./work-types-shared.js";
 
 // Небольшой генератор CRUD-роутера для простых справочников вида
 // { id, name, ... } — objects, employees, units, work_types.
@@ -28,6 +35,10 @@ function makeDirectoryRouter({
   validate,
   entityType,
   listWhere,
+  // work_types нужен свой POST "/" (каскадные поля дерева, роли admin+curator
+  // вместо только admin) — при customCreate=true фабрика не регистрирует
+  // здесь общий POST, вызывающий код сам вешает его на тот же router.
+  customCreate = false,
 }) {
   const router = Router();
   const cols = columns.join(", ");
@@ -47,36 +58,38 @@ function makeDirectoryRouter({
     }),
   );
 
-  router.post(
-    "/",
-    requireRole("admin"),
-    asyncHandler(async (req, res) => {
-      // validate — необязательная проверка перед записью (например, уникальность
-      // по имени без учёта регистра/пробелов). Возвращает текст ошибки или null.
-      if (validate) {
-        const error = await validate(pool, req.body, null);
-        if (error) return res.status(400).json({ error });
-      }
-      const values = columns.map((c) => req.body[c]);
-      const placeholders = columns.map((_, i) => `$${i + 1}`).join(", ");
-      const { rows } = await pool.query(
-        `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) RETURNING id, ${cols}`,
-        values,
-      );
-      if (entityType) {
-        await insertAuditLog(pool, {
-          entityType,
-          entityId: rows[0].id,
-          action: "create",
-          actorUserId: req.user.id,
-          actorName: req.user.full_name,
-          before: null,
-          after: rows[0],
-        });
-      }
-      res.status(201).json(rows[0]);
-    }),
-  );
+  if (!customCreate) {
+    router.post(
+      "/",
+      requireRole("admin"),
+      asyncHandler(async (req, res) => {
+        // validate — необязательная проверка перед записью (например, уникальность
+        // по имени без учёта регистра/пробелов). Возвращает текст ошибки или null.
+        if (validate) {
+          const error = await validate(pool, req.body, null);
+          if (error) return res.status(400).json({ error });
+        }
+        const values = columns.map((c) => req.body[c]);
+        const placeholders = columns.map((_, i) => `$${i + 1}`).join(", ");
+        const { rows } = await pool.query(
+          `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) RETURNING id, ${cols}`,
+          values,
+        );
+        if (entityType) {
+          await insertAuditLog(pool, {
+            entityType,
+            entityId: rows[0].id,
+            action: "create",
+            actorUserId: req.user.id,
+            actorName: req.user.full_name,
+            before: null,
+            after: rows[0],
+          });
+        }
+        res.status(201).json(rows[0]);
+      }),
+    );
+  }
 
   router.put(
     "/:id",
@@ -425,44 +438,10 @@ export const unitsRouter = makeDirectoryRouter({
   entityType: "unit",
 });
 
-// Каскадный пересчёт: название/единица/цена вида работы всегда должны
-// совпадать с тем, что показано во всех записях, где он использован —
-// в т.ч. уже завершённых (done). Прежние значения нигде не сохраняются
-// (по явному решению — история изменений цен не нужна), но сам факт
-// изменения остаётся в audit_log.
-//
-// Вынесено в отдельную функцию, чтобы использовать её из двух мест:
-// обновление через справочник (см. workTypesRouter ниже) и авто-обновление
-// при одобрении заявки (см. upsertWorkTypeByName и requests.js) — раньше
-// эти два пути были рассинхронизированы: одобрение заявки писало цену
-// напрямую в work_types в обход и каскада, и audit_log.
-async function cascadeWorkTypeUpdate(client, updated) {
-  await client.query(
-    `UPDATE record_items
-        SET name = $1, unit = $2, price = $3, sum = qty * $3
-      WHERE work_type_id = $4`,
-    [updated.name, updated.unit, updated.price, updated.id],
-  );
-  await client.query(
-    `UPDATE records r
-        SET total = sub.total
-       FROM (
-         SELECT record_id, COALESCE(SUM(sum), 0) AS total
-         FROM record_items
-         WHERE record_id IN (SELECT DISTINCT record_id FROM record_items WHERE work_type_id = $1)
-         GROUP BY record_id
-       ) sub
-      WHERE r.id = sub.record_id`,
-    [updated.id],
-  );
-}
-
-function validatePrice(price) {
-  if (price == null) return null;
-  const n = Number(price);
-  if (!Number.isFinite(n) || n < 0) return "Цена должна быть неотрицательным числом";
-  return null;
-}
+// cascadeWorkTypeUpdate/validatePrice — вынесены в work-types-shared.js,
+// т.к. нужны также work-types-tree.js (каскадное редактирование дерева).
+// Использование ниже (afterUpdate, validate, upsertWorkTypeByName) не
+// изменилось.
 
 export const workTypesRouter = makeDirectoryRouter({
   table: "work_types",
@@ -478,20 +457,154 @@ export const workTypesRouter = makeDirectoryRouter({
     if (nameError) return nameError;
     return validatePrice(body.price);
   },
+  // POST "/" здесь — не простой INSERT (name/unit/price): для дерева
+  // (parent_id, level=5, sbornik_id, gesn_code и т.д.) нужна отдельная
+  // логика — см. кастомный обработчик ниже.
+  customCreate: true,
 });
+
+// POST /api/work-types — создание нового листа (level=5) дерева видов работ.
+// source='manual' — как и у узлов, создаваемых вручную через /nodes.
+// Роли admin+curator (шире, чем остальной CRUD этого справочника, который
+// admin-only) — согласовано с остальными новыми эндпоинтами каскадного
+// редактирования дерева.
+workTypesRouter.post(
+  "/",
+  requireRole("admin", "curator"),
+  asyncHandler(async (req, res) => {
+    const {
+      parent_id,
+      name,
+      variant_label,
+      unit,
+      price,
+      has_price,
+      labor_hours,
+      gesn_code,
+      work_composition,
+      sort_order,
+    } = req.body || {};
+
+    const parentId = Number(parent_id);
+    if (!Number.isInteger(parentId)) {
+      return res.status(400).json({ error: "parent_id обязателен и должен быть целым числом" });
+    }
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "Укажите название" });
+    }
+    const priceError = validatePrice(price);
+    if (priceError) return res.status(400).json({ error: priceError });
+
+    const { rows: parentRows } = await pool.query(
+      `SELECT id, level, status, sbornik_id, catalog_type FROM work_types WHERE id = $1`,
+      [parentId],
+    );
+    const parent = parentRows[0];
+    if (!parent) return res.status(400).json({ error: "Родительский узел не найден" });
+    if (parent.status === "archived") {
+      return res.status(400).json({ error: "Родительский узел архивирован" });
+    }
+    if (parent.level >= 5) {
+      return res.status(400).json({ error: "Родитель не может быть листом" });
+    }
+
+    const nameError = await checkNameUniqueAmongSiblings(pool, {
+      parentId: parent.id,
+      catalogType: parent.catalog_type,
+      name,
+      excludeId: null,
+    });
+    if (nameError) return res.status(409).json({ error: nameError });
+
+    const sbornikId = parent.level === 1 ? parent.id : parent.sbornik_id;
+    const trimmedGesnCode = gesn_code != null && String(gesn_code).trim() ? String(gesn_code).trim() : null;
+
+    if (trimmedGesnCode) {
+      const gesnError = await checkGesnCodeUnique(pool, sbornikId, trimmedGesnCode, null);
+      if (gesnError) return res.status(409).json({ error: gesnError });
+    }
+
+    let newId;
+    try {
+      const { rows } = await pool.query(
+        `INSERT INTO work_types
+           (parent_id, level, catalog_type, sbornik_id, name, variant_label, unit, price, has_price,
+            labor_hours, gesn_code, work_composition, sort_order, source, status)
+         VALUES ($1,5,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'manual','active')
+         RETURNING id`,
+        [
+          parent.id,
+          parent.catalog_type,
+          sbornikId,
+          String(name).trim(),
+          variant_label || null,
+          unit || null,
+          price ?? 0,
+          has_price !== false,
+          labor_hours ?? null,
+          trimmedGesnCode,
+          work_composition || null,
+          sort_order ?? 0,
+        ],
+      );
+      newId = rows[0].id;
+    } catch (err) {
+      if (err.code === "23505" && err.constraint === "idx_work_types_sbornik_gesn_code") {
+        return res.status(409).json({ error: `Код ГЭСН «${trimmedGesnCode}» уже используется в этом сборнике` });
+      }
+      throw err;
+    }
+
+    const detail = await buildLeafDetail(pool, newId);
+    await insertAuditLog(pool, {
+      entityType: "work_type",
+      entityId: newId,
+      action: "create",
+      actorUserId: req.user.id,
+      actorName: req.user.full_name,
+      before: null,
+      after: detail,
+    });
+    res.status(201).json(detail);
+  }),
+);
 
 // Архивация вместо жёсткого удаления — record_items.work_type_id уже
 // использованных видов работ не должен терять связь со справочником.
 // Паттерн — прямая копия objectsRouter.patch("/:id/archive"...) выше.
+//
+// Для контейнеров дерева (level < 5) дополнительно запрещаем архивацию,
+// пока внутри (на любой глубине) остаются неархивные листья — иначе они
+// молча "пропадают" из каскада (родителя не найти через /tree), хотя сами
+// формально всё ещё активны.
 workTypesRouter.patch(
   "/:id/archive",
   requireRole("admin"),
   asyncHandler(async (req, res) => {
     const { rows: beforeRows } = await pool.query(
-      `SELECT id, name, unit, price, status, archived_at FROM work_types WHERE id = $1`,
+      `SELECT id, name, unit, price, status, archived_at, level FROM work_types WHERE id = $1`,
       [req.params.id],
     );
     if (!beforeRows[0]) return res.status(404).json({ error: "not found" });
+
+    if (beforeRows[0].level < 5) {
+      const { rows: activeLeafRows } = await pool.query(
+        `WITH RECURSIVE sub AS (
+           SELECT id FROM work_types WHERE id = $1
+           UNION ALL
+           SELECT wt.id FROM work_types wt JOIN sub ON wt.parent_id = sub.id
+         )
+         SELECT 1 FROM work_types
+          WHERE id IN (SELECT id FROM sub) AND id <> $1 AND level = 5 AND status <> 'archived'
+          LIMIT 1`,
+        [req.params.id],
+      );
+      if (activeLeafRows.length) {
+        return res.status(409).json({
+          error: "Внутри раздела есть неархивные виды работ — сначала заархивируйте их",
+        });
+      }
+    }
 
     const { rows } = await pool.query(
       `UPDATE work_types SET status = 'archived', archived_at = now()

@@ -104,6 +104,13 @@ export function requireRole(...roles) {
   };
 }
 
+// Используется там, где нужно посчитать признак "может редактировать" внутри
+// уже загруженного списка (напр. work-types-tree.js — поле can_edit в /tree),
+// а не только как route-level middleware вроде requireRole выше.
+export function isAdminLike(user) {
+  return !!user && (user.role === "admin" || user.role === "curator");
+}
+
 export async function verifyPassword(plain, hash) {
   return bcrypt.compare(plain, hash);
 }

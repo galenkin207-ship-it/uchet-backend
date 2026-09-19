@@ -1,12 +1,23 @@
 import { Router } from "express";
 import { pool } from "../db.js";
-import { requireAuth } from "../auth.js";
+import { requireAuth, requireRole, isAdminLike } from "../auth.js";
 import { asyncHandler } from "../async-handler.js";
+import { insertAuditLog } from "../audit.js";
+import {
+  validatePrice,
+  cascadeWorkTypeUpdate,
+  checkNameUniqueAmongSiblings,
+  checkGesnCodeUnique,
+  buildLeafDetail,
+} from "./work-types-shared.js";
 
-// Read-only роутер поверх древовидной структуры work_types (level, parent_id,
+// Роутер поверх древовидной структуры work_types (level, parent_id,
 // catalog_type — миграция 017/018). Отдельно от workTypesRouter/directories.js —
-// тот остаётся плоским CRUD-справочником для админки, этот — для каскадного
-// выбора вида работы и полнотекстового поиска по дереву на фронте/мобильном.
+// тот остаётся плоским CRUD-справочником для админки (простые виды работ без
+// дерева), этот — каскадный выбор вида работы и полнотекстовый поиск по дереву
+// на фронте/мобильном (GET /tree, /search, /:baseId/counter-steps — любой
+// авторизованный), плюс каскадное редактирование самого дерева (GET .../detail,
+// PATCH .../edit, POST/PATCH .../nodes — только admin/curator).
 export const workTypesTreeRouter = Router();
 
 const TREE_COLUMNS = `
@@ -132,7 +143,8 @@ workTypesTreeRouter.get(
         "wt.parent_id IS NULL AND wt.level = 1 AND wt.catalog_type = $1",
         [type],
       );
-      return res.json({ items: rows });
+      const canEdit = isAdminLike(req.user);
+      return res.json({ items: rows.map((r) => ({ ...r, can_edit: canEdit })) });
     }
 
     const id = Number(parentId);
@@ -147,8 +159,9 @@ workTypesTreeRouter.get(
     const parentNameStripped = parentRows[0] ? stripCodePrefix(parentRows[0].name) : null;
 
     const items = await expandDuplicateGroups(id, parentNameStripped);
+    const canEdit = isAdminLike(req.user);
 
-    res.json({ items });
+    res.json({ items: items.map((r) => ({ ...r, can_edit: canEdit })) });
   }),
 );
 
@@ -292,5 +305,380 @@ workTypesTreeRouter.get(
       .map(({ score, ...item }) => item);
 
     res.json({ items });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// Каскадное редактирование дерева (только admin/curator).
+// ---------------------------------------------------------------------------
+
+// GET /:id/detail — лист (level=5) целиком: все редактируемые + служебные
+// поля, цепочка предков от корня вниз (реальные узлы, БЕЗ схлопывания
+// дублирующих групп — см. expandDuplicateGroups выше, фронт схлопывает сам
+// при отображении breadcrumb) и placeholder materials (данных пока нет).
+workTypesTreeRouter.get(
+  "/:id/detail",
+  requireRole("admin", "curator"),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: "id должен быть целым числом" });
+    }
+    const detail = await buildLeafDetail(pool, id);
+    if (!detail) return res.status(404).json({ error: "not found" });
+    if (detail.level !== 5) {
+      return res.status(400).json({ error: "Узел не является листом" });
+    }
+    res.json(detail);
+  }),
+);
+
+const LEAF_EDITABLE_FIELDS = [
+  "name",
+  "variant_label",
+  "unit",
+  "price",
+  "has_price",
+  "labor_hours",
+  "gesn_code",
+  "work_composition",
+  "sort_order",
+];
+
+// PATCH /:id/edit — изменение листа (level=5): поля из LEAF_EDITABLE_FIELDS
+// плюс необязательная смена родителя (parent_id). level листа не меняется
+// никогда (лист всегда level=5) — при смене parent_id пересчитывается только
+// sbornik_id по новому родителю. Транзакция: строка блокируется FOR UPDATE,
+// после UPDATE — тот же каскад в record_items/records, что и у обычного
+// справочника (cascadeWorkTypeUpdate), и audit_log — всё атомарно.
+workTypesTreeRouter.patch(
+  "/:id/edit",
+  requireRole("admin", "curator"),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: "id должен быть целым числом" });
+    }
+    const body = req.body || {};
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const { rows: currentRows } = await client.query(
+        `SELECT * FROM work_types WHERE id = $1 FOR UPDATE`,
+        [id],
+      );
+      const current = currentRows[0];
+      if (!current) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "not found" });
+      }
+      if (current.level !== 5) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Узел не является листом" });
+      }
+
+      if ("price" in body) {
+        const priceError = validatePrice(body.price);
+        if (priceError) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: priceError });
+        }
+      }
+      if ("name" in body && (!body.name || !String(body.name).trim())) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Укажите название" });
+      }
+
+      let newParentId = current.parent_id;
+      let newSbornikId = current.sbornik_id;
+      let newCatalogType = current.catalog_type;
+      const parentChanged = "parent_id" in body && Number(body.parent_id) !== current.parent_id;
+
+      if (parentChanged) {
+        const parentId = Number(body.parent_id);
+        if (!Number.isInteger(parentId)) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "parent_id должен быть целым числом" });
+        }
+        const { rows: parentRows } = await client.query(
+          `SELECT id, level, status, sbornik_id, catalog_type FROM work_types WHERE id = $1`,
+          [parentId],
+        );
+        const parent = parentRows[0];
+        if (!parent) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Родительский узел не найден" });
+        }
+        if (parent.status === "archived") {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Родительский узел архивирован" });
+        }
+        if (parent.level >= 5) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Родитель не может быть листом" });
+        }
+        newParentId = parent.id;
+        newSbornikId = parent.level === 1 ? parent.id : parent.sbornik_id;
+        newCatalogType = parent.catalog_type;
+      }
+
+      const finalName = "name" in body ? body.name : current.name;
+      const nameError = await checkNameUniqueAmongSiblings(client, {
+        parentId: newParentId,
+        catalogType: newCatalogType,
+        name: finalName,
+        excludeId: id,
+      });
+      if (nameError) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: nameError });
+      }
+
+      const finalGesnCode = "gesn_code" in body
+        ? (body.gesn_code != null && String(body.gesn_code).trim() ? String(body.gesn_code).trim() : null)
+        : current.gesn_code;
+      if (finalGesnCode) {
+        const gesnError = await checkGesnCodeUnique(client, newSbornikId, finalGesnCode, id);
+        if (gesnError) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({ error: gesnError });
+        }
+      }
+
+      const setParts = [];
+      const values = [];
+      let idx = 1;
+      for (const field of LEAF_EDITABLE_FIELDS) {
+        if (!(field in body)) continue;
+        setParts.push(`${field} = $${idx}`);
+        if (field === "name") values.push(String(body.name).trim());
+        else if (field === "gesn_code") values.push(finalGesnCode);
+        else values.push(body[field]);
+        idx += 1;
+      }
+      if (parentChanged) {
+        setParts.push(`parent_id = $${idx}`);
+        values.push(newParentId);
+        idx += 1;
+        setParts.push(`sbornik_id = $${idx}`);
+        values.push(newSbornikId);
+        idx += 1;
+      }
+      if (!setParts.length) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Нет полей для изменения" });
+      }
+      values.push(id);
+
+      let updatedRow;
+      try {
+        const { rows } = await client.query(
+          `UPDATE work_types SET ${setParts.join(", ")} WHERE id = $${idx} RETURNING *`,
+          values,
+        );
+        updatedRow = rows[0];
+      } catch (err) {
+        await client.query("ROLLBACK");
+        if (err.code === "23505" && err.constraint === "idx_work_types_sbornik_gesn_code") {
+          return res.status(409).json({ error: `Код ГЭСН «${finalGesnCode}» уже используется в этом сборнике` });
+        }
+        throw err;
+      }
+
+      await cascadeWorkTypeUpdate(client, updatedRow);
+
+      await insertAuditLog(client, {
+        entityType: "work_type",
+        entityId: id,
+        action: "update",
+        actorUserId: req.user.id,
+        actorName: req.user.full_name,
+        before: current,
+        after: updatedRow,
+      });
+
+      await client.query("COMMIT");
+
+      const detail = await buildLeafDetail(pool, id);
+      res.json(detail);
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }),
+);
+
+// POST /nodes — создание узла-контейнера (level 1-4). parent_id === null/
+// отсутствует => создаётся корень (level=1), тогда catalog_type обязателен.
+// Иначе level = parent.level+1 (родитель обязан быть сам контейнером,
+// level 1-3 — контейнер level=4 дочерних контейнеров не имеет, только
+// листья level=5 через POST /api/work-types), sbornik_id/catalog_type
+// наследуются от родителя (catalog_type можно переопределить явно).
+workTypesTreeRouter.post(
+  "/nodes",
+  requireRole("admin", "curator"),
+  asyncHandler(async (req, res) => {
+    const { parent_id, name, catalog_type, sort_order } = req.body || {};
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "Укажите название" });
+    }
+
+    let parent = null;
+    if (parent_id != null && parent_id !== "") {
+      const parentId = Number(parent_id);
+      if (!Number.isInteger(parentId)) {
+        return res.status(400).json({ error: "parent_id должен быть целым числом" });
+      }
+      const { rows } = await pool.query(
+        `SELECT id, level, status, sbornik_id, catalog_type FROM work_types WHERE id = $1`,
+        [parentId],
+      );
+      parent = rows[0];
+      if (!parent) return res.status(400).json({ error: "Родительский узел не найден" });
+      if (parent.status === "archived") {
+        return res.status(400).json({ error: "Родительский узел архивирован" });
+      }
+      if (parent.level >= 4) {
+        return res.status(400).json({ error: "У этого узла не может быть дочерних разделов" });
+      }
+    } else if (!catalog_type) {
+      return res.status(400).json({ error: "Для корневого узла укажите catalog_type" });
+    }
+
+    const level = parent ? parent.level + 1 : 1;
+    const resolvedCatalogType = catalog_type || (parent ? parent.catalog_type : null);
+
+    const nameError = await checkNameUniqueAmongSiblings(pool, {
+      parentId: parent ? parent.id : null,
+      catalogType: resolvedCatalogType,
+      name,
+      excludeId: null,
+    });
+    if (nameError) return res.status(409).json({ error: nameError });
+
+    const { rows: insertedRows } = await pool.query(
+      `INSERT INTO work_types (parent_id, level, catalog_type, sbornik_id, name, sort_order, source, status)
+       VALUES ($1,$2,$3,$4,$5,$6,'manual','active')
+       RETURNING id`,
+      [
+        parent ? parent.id : null,
+        level,
+        resolvedCatalogType,
+        parent ? parent.sbornik_id : null,
+        String(name).trim(),
+        sort_order ?? 0,
+      ],
+    );
+    const newId = insertedRows[0].id;
+
+    // Корень (level=1) — свой собственный sbornik_id (см. миграция 025),
+    // известен только после вставки (нужен собственный id).
+    if (level === 1) {
+      await pool.query(`UPDATE work_types SET sbornik_id = $1 WHERE id = $1`, [newId]);
+    }
+
+    const { rows: finalRows } = await pool.query(`SELECT ${TREE_COLUMNS} FROM work_types WHERE id = $1`, [newId]);
+    // Свежесозданный узел заведомо без детей — не через fetchChildrenRows
+    // (её WHERE требует хотя бы один настоящий лист в поддереве, у пустого
+    // контейнера такого ещё нет, и запрос вернул бы 0 строк).
+    const node = { ...finalRows[0], has_children: false, has_counter_steps: false, can_edit: true };
+
+    await insertAuditLog(pool, {
+      entityType: "work_type",
+      entityId: newId,
+      action: "create",
+      actorUserId: req.user.id,
+      actorName: req.user.full_name,
+      before: null,
+      after: node,
+    });
+
+    res.status(201).json(node);
+  }),
+);
+
+// PATCH /nodes/:id — переименование контейнера (+ sort_order). Смена
+// родителя намеренно не поддерживается здесь (не нужна по ТЗ) — для узлов
+// это отдельная операция, которой пока нет. Архивация — через уже
+// существующий PATCH /:id/archive (с проверкой на неархивные листья внутри,
+// см. directories.js).
+workTypesTreeRouter.patch(
+  "/nodes/:id",
+  requireRole("admin", "curator"),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: "id должен быть целым числом" });
+    }
+
+    const { rows: currentRows } = await pool.query(
+      `SELECT id, parent_id, level, catalog_type, sbornik_id, name, sort_order, status
+         FROM work_types WHERE id = $1`,
+      [id],
+    );
+    const current = currentRows[0];
+    if (!current) return res.status(404).json({ error: "not found" });
+    if (current.level === 5) {
+      return res.status(400).json({ error: "Это лист — используйте /:id/edit" });
+    }
+
+    const body = req.body || {};
+    if (!("name" in body) && !("sort_order" in body)) {
+      return res.status(400).json({ error: "Нет полей для изменения" });
+    }
+
+    const finalName = "name" in body ? body.name : current.name;
+    if (!finalName || !String(finalName).trim()) {
+      return res.status(400).json({ error: "Укажите название" });
+    }
+
+    if ("name" in body) {
+      const nameError = await checkNameUniqueAmongSiblings(pool, {
+        parentId: current.parent_id,
+        catalogType: current.catalog_type,
+        name: finalName,
+        excludeId: id,
+      });
+      if (nameError) return res.status(409).json({ error: nameError });
+    }
+
+    const setParts = [];
+    const values = [];
+    let idx = 1;
+    if ("name" in body) {
+      setParts.push(`name = $${idx}`);
+      values.push(String(body.name).trim());
+      idx += 1;
+    }
+    if ("sort_order" in body) {
+      setParts.push(`sort_order = $${idx}`);
+      values.push(body.sort_order);
+      idx += 1;
+    }
+    values.push(id);
+
+    const { rows } = await pool.query(
+      `UPDATE work_types SET ${setParts.join(", ")}
+       WHERE id = $${idx}
+       RETURNING id, parent_id, level, catalog_type, sbornik_id, name, sort_order, status`,
+      values,
+    );
+    const updated = rows[0];
+
+    await insertAuditLog(pool, {
+      entityType: "work_type",
+      entityId: id,
+      action: "update",
+      actorUserId: req.user.id,
+      actorName: req.user.full_name,
+      before: current,
+      after: updated,
+    });
+
+    res.json({ ...updated, can_edit: true });
   }),
 );
