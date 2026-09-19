@@ -164,7 +164,7 @@ function createResolver(client, { dryRun }) {
     return result;
   }
 
-  async function getOrCreateContainer({ parentId, level, name, catalogType, createdList }) {
+  async function getOrCreateContainer({ parentId, level, name, catalogType, sbornikId, createdList }) {
     const key = `${parentId}|${level}|${name}`;
     if (containerCache.has(key)) return containerCache.get(key);
 
@@ -188,9 +188,9 @@ function createResolver(client, { dryRun }) {
 
     const sortOrder = await nextSortOrder(parentId);
     const { rows } = await client.query(
-      `INSERT INTO work_types (name, level, parent_id, catalog_type, unit, price, has_price, source, sort_order)
-       VALUES ($1,$2,$3,$4,'-',0,false,'user_added',$5) RETURNING id`,
-      [name, level, parentId, catalogType, sortOrder],
+      `INSERT INTO work_types (name, level, parent_id, catalog_type, unit, price, has_price, source, sort_order, sbornik_id)
+       VALUES ($1,$2,$3,$4,'-',0,false,'user_added',$5,$6) RETURNING id`,
+      [name, level, parentId, catalogType, sortOrder, sbornikId],
     );
     containerCache.set(key, rows[0].id);
     return rows[0].id;
@@ -216,7 +216,9 @@ function createResolver(client, { dryRun }) {
   // Резолвит "родителя раздела" для одного item (single или group) — либо
   // существующий узел (level=1 напрямую при razdel=null, level=2 при точном
   // совпадении имени), либо только что созданный/зарезервированный level=3
-  // "новый раздел". Возвращает { parentId, catalogType } или { error }.
+  // "новый раздел". Возвращает { parentId, catalogType, sbornikId } или
+  // { error }. sbornikId (id узла level=1) прокидывается дальше в
+  // getOrCreateContainer/leaf insert — см. миграцию 025.
   async function resolveSectionParent(item) {
     const sbornikId = await findSbornik(item.sbornik, item.type);
     if (sbornikId == null) {
@@ -228,7 +230,7 @@ function createResolver(client, { dryRun }) {
     if (razdelBlank && !item.razdel_is_new) {
       // Подтверждено Константином: razdel=null + razdel_is_new=false —
       // позиция без раздела, парентится прямо под сборник (level=1).
-      return { parentId: sbornikId, catalogType: item.type };
+      return { parentId: sbornikId, catalogType: item.type, sbornikId };
     }
 
     if (!item.razdel_is_new) {
@@ -236,7 +238,7 @@ function createResolver(client, { dryRun }) {
       if (razdelId == null) {
         return { error: `раздел не найден: сборник="${item.sbornik}", razdel="${item.razdel}"` };
       }
-      return { parentId: razdelId, catalogType: item.type };
+      return { parentId: razdelId, catalogType: item.type, sbornikId };
     }
 
     // razdel_is_new === true
@@ -249,9 +251,10 @@ function createResolver(client, { dryRun }) {
       level: 3,
       name: item.razdel,
       catalogType: item.type,
+      sbornikId,
       createdList: stats.newLevel3ToCreate,
     });
-    return { parentId: newLevel3Id, catalogType: item.type };
+    return { parentId: newLevel3Id, catalogType: item.type, sbornikId };
   }
 
   return { resolveSectionParent, getOrCreateContainer, nextSortOrder, stats };
@@ -293,6 +296,7 @@ export async function buildPlan(client, items, { dryRun }) {
         level: 4,
         name: task.groupName,
         catalogType: section.catalogType,
+        sbornikId: section.sbornikId,
         createdList: resolver.stats.level4ToCreate,
       });
       parentId = groupId;
@@ -303,6 +307,7 @@ export async function buildPlan(client, items, { dryRun }) {
     toInsertLeaves.push({
       parentId,
       catalogType: section.catalogType,
+      sbornikId: section.sbornikId,
       name: task.name,
       unit: task.unit,
       price: task.price,
@@ -377,8 +382,8 @@ async function runApply(client, plan) {
     await client.query(
       `INSERT INTO work_types
          (name, level, parent_id, catalog_type, unit, price, has_price, is_step_item,
-          is_counter_step, gesn_code, variant_label, legacy_num, source, sort_order)
-       VALUES ($1,5,$2,$3,$4,$5,true,false,false,NULL,$6,$7,'user_added',$8)`,
+          is_counter_step, gesn_code, variant_label, legacy_num, source, sort_order, sbornik_id)
+       VALUES ($1,5,$2,$3,$4,$5,true,false,false,NULL,$6,$7,'user_added',$8,$9)`,
       [
         leaf.name,
         leaf.parentId,
@@ -388,6 +393,7 @@ async function runApply(client, plan) {
         leaf.variantLabel,
         leaf.legacyNum,
         leaf.sortOrder,
+        leaf.sbornikId,
       ],
     );
     inserted++;

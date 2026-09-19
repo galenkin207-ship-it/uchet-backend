@@ -32,6 +32,7 @@ const COMMON_COLUMNS = [
   "sort_order",
   "source",
   "has_price",
+  "sbornik_id",
 ];
 
 function toRow(node) {
@@ -49,6 +50,7 @@ function toRow(node) {
     node.sortOrder,
     "gesn_catalog",
     node.hasPrice,
+    node.sbornikId,
   ];
 }
 
@@ -117,6 +119,7 @@ function buildTree(items) {
       level2.push({
         key: l2Key,
         parentKey: l1Key,
+        l1Key,
         name: item["раздел"],
         catalogType,
         sortOrder: nextOrder(l1Key),
@@ -129,6 +132,7 @@ function buildTree(items) {
       level3.push({
         key: l3Key,
         parentKey: l2Key,
+        l1Key,
         name: item["таблица"],
         catalogType,
         sortOrder: nextOrder(l2Key),
@@ -141,6 +145,7 @@ function buildTree(items) {
       level4.push({
         key: l4Key,
         parentKey: l3Key,
+        l1Key,
         name: item["группа"],
         catalogType,
         sortOrder: nextOrder(l3Key),
@@ -150,6 +155,7 @@ function buildTree(items) {
     const hasPrice = !!item["есть_цена"];
     leaves.push({
       parentKey: l4Key,
+      l1Key,
       catalogType,
       name: item["наименование"],
       unit: item["ед_изм"],
@@ -239,9 +245,16 @@ async function runImport(tree, force) {
           isStepItem: false,
           sortOrder: n.sortOrder,
           hasPrice: false,
+          sbornikId: null, // id ещё не известен на момент вставки, см. UPDATE ниже
         }),
       ),
     );
+    // sbornik_id для строк level=1 — собственный id (см. миграция 025);
+    // недоступен при вставке (id даёт только сама вставка), поэтому одним
+    // отдельным UPDATE сразу после.
+    if (level1Ids.length) {
+      await client.query("UPDATE work_types SET sbornik_id = id WHERE id = ANY($1)", [level1Ids]);
+    }
     const level1IdByKey = new Map(tree.level1.map((n, i) => [n.key, level1Ids[i]]));
 
     const level2Ids = await batchInsert(
@@ -261,6 +274,7 @@ async function runImport(tree, force) {
           isStepItem: false,
           sortOrder: n.sortOrder,
           hasPrice: false,
+          sbornikId: level1IdByKey.get(n.l1Key),
         }),
       ),
     );
@@ -283,6 +297,7 @@ async function runImport(tree, force) {
           isStepItem: false,
           sortOrder: n.sortOrder,
           hasPrice: false,
+          sbornikId: level1IdByKey.get(n.l1Key),
         }),
       ),
     );
@@ -305,6 +320,7 @@ async function runImport(tree, force) {
           isStepItem: false,
           sortOrder: n.sortOrder,
           hasPrice: false,
+          sbornikId: level1IdByKey.get(n.l1Key),
         }),
       ),
     );
@@ -327,6 +343,7 @@ async function runImport(tree, force) {
           isStepItem: leaf.isStepItem,
           sortOrder: leaf.sortOrder,
           hasPrice: leaf.hasPrice,
+          sbornikId: level1IdByKey.get(leaf.l1Key),
         }),
       ),
     );
