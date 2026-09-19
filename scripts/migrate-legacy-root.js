@@ -740,6 +740,24 @@ async function applyOverrides(client, fullOverrides, legacyRows, copies) {
     copiesByNameNorm.get(c.nameNorm).push(c);
   }
 
+  // Две строки поправок с одним и тем же old_n — почти наверняка ошибка
+  // редактирования файла (правка задумывалась как ЗАМЕНА, а не добавление) —
+  // вторая молча перезаписала бы решение первой (или дала бы дублирующую
+  // строку плана на тот же legacy_id). Падаем сразу с понятным сообщением,
+  // а не гадаем, какая из них "настоящая".
+  const seenOldN = new Map();
+  for (const ov of fullOverrides) {
+    if (ov.old_n == null) continue;
+    if (seenOldN.has(ov.old_n)) {
+      throw new Error(
+        `scripts/data/legacy_overrides.json: old_n=${ov.old_n} встречается больше одного раза среди строк ` +
+          `с action (${seenOldN.get(ov.old_n)} и ${ov.action}) — это должна быть ЗАМЕНА, а не две строки. ` +
+          `Уберите дубликат.`,
+      );
+    }
+    seenOldN.set(ov.old_n, ov.action);
+  }
+
   const handledIds = new Set();
   const rows = [];
 
@@ -840,6 +858,66 @@ function applyAdjustments(rows, adjustments) {
   return report;
 }
 
+// Двойное занятие копии: одна копия (по copy_legacy_num — портируемый ключ)
+// не может достаться двум РАЗНЫМ legacy-строкам. Раньше это могло произойти
+// молча: автоплан отдаёт копию одной строке, override match_copy/
+// place_next_to — той же копии, но другой строке; вторая при --apply падала
+// в "уже сделано" (копия archived) и просто оставалась под корнем без
+// объяснений (это и случилось на staging со строкой 930). Здесь — явная
+// проверка ПОСЛЕ сборки итогового плана, до отчёта/записи файлов:
+//   - move/match_copy/move_and_archive_twins (сама копия + все близнецы) —
+//     каждый copy_legacy_num должен встречаться максимум у одной строки;
+//   - place_next_to сам по себе НЕ архивирует копию, поэтому две разные
+//     place_next_to на одну копию — не конфликт (обе законно становятся её
+//     соседями); но если тот же copy_legacy_num ТАКЖЕ архивируется другой
+//     строкой (move/match_copy/twins) — это конфликт: копия, рядом с которой
+//     должна была остаться place_next_to-строка, перестанет существовать
+//     активной.
+// Возвращает список конфликтов; buildPlan() и --apply останавливаются, если
+// список не пуст (см. вызовы ниже).
+function findDoubleClaimConflicts(rows) {
+  const claims = new Map(); // legacyNum -> [row,...] (move/match_copy/twins, включая близнецов)
+  const addClaim = (legacyNum, row) => {
+    if (legacyNum == null) return;
+    if (!claims.has(legacyNum)) claims.set(legacyNum, []);
+    claims.get(legacyNum).push(row);
+  };
+  for (const row of rows) {
+    if (row.action === "move" || row.action === "match_copy") {
+      addClaim(row.copy_legacy_num, row);
+    } else if (row.action === "move_and_archive_twins") {
+      addClaim(row.copy_legacy_num, row);
+      for (const t of row.twin_copy_legacy_nums ?? []) addClaim(t, row);
+    }
+  }
+
+  const conflicts = [];
+  for (const [legacyNum, claimants] of claims) {
+    if (claimants.length > 1) conflicts.push({ copyLegacyNum: legacyNum, claimants });
+  }
+
+  for (const row of rows) {
+    if (row.action !== "place_next_to") continue;
+    const claimants = claims.get(row.copy_legacy_num);
+    if (claimants && claimants.length) {
+      conflicts.push({ copyLegacyNum: row.copy_legacy_num, claimants: [row, ...claimants], placeNextTo: true });
+    }
+  }
+  return conflicts;
+}
+
+function describeDoubleClaimConflicts(conflicts) {
+  return conflicts
+    .map((c) => {
+      const rowsDesc = c.claimants
+        .map((r) => `legacy_id=${r.legacy_id} old_n=${r.old_n} action=${r.action} "${r.legacy_name}"`)
+        .join(" И ");
+      const kind = c.placeNextTo ? " (place_next_to рядом с копией, которую архивирует другая строка)" : "";
+      return `  copy_legacy_num=${c.copyLegacyNum}${kind}: ${rowsDesc}`;
+    })
+    .join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // buildPlan
 // ---------------------------------------------------------------------------
@@ -879,7 +957,35 @@ export async function buildPlan(client) {
 
   const rows = [...overrideRows, ...algoRows, ...mergeRows].sort((a, b) => a.legacy_id - b.legacy_id);
 
+  const doubleClaimConflicts = findDoubleClaimConflicts(rows);
+  if (doubleClaimConflicts.length) {
+    throw new Error(
+      `Обнаружено ${doubleClaimConflicts.length} случаев двойного занятия копии (одна копия нужна ` +
+        `нескольким legacy-строкам) — построение плана остановлено, файлы CSV/JSON НЕ записаны:\n` +
+        describeDoubleClaimConflicts(doubleClaimConflicts),
+    );
+  }
+
   const adjustmentReport = applyAdjustments(rows, adjustments);
+
+  // record_items, которые будут перепривязаны С АРХИВИРУЕМЫХ КОПИЙ на
+  // перенесённые legacy-строки (move/match_copy — сама копия; twins — слот
+  // + все близнецы). Это НЕ то же самое, что "record_items" в сводке по
+  // статусам (там — record_items самой legacy-строки, который никуда не
+  // денется, т.к. id строки не меняется) — на staging было 0 (копии свежие,
+  // ссылок на них ещё не завели), на проде может быть больше.
+  const copyByLegacyNum = new Map(copies.map((c) => [c.legacyNum, c]));
+  let recordItemsOnArchivedCopies = 0;
+  for (const row of rows) {
+    if (row.action === "move" || row.action === "match_copy") {
+      recordItemsOnArchivedCopies += copyByLegacyNum.get(row.copy_legacy_num)?.recordItemsCount ?? 0;
+    } else if (row.action === "move_and_archive_twins") {
+      recordItemsOnArchivedCopies += copyByLegacyNum.get(row.copy_legacy_num)?.recordItemsCount ?? 0;
+      for (const t of row.twin_copy_legacy_nums ?? []) {
+        recordItemsOnArchivedCopies += copyByLegacyNum.get(t)?.recordItemsCount ?? 0;
+      }
+    }
+  }
 
   const summary = new Map();
   for (const row of rows) {
@@ -910,6 +1016,7 @@ export async function buildPlan(client) {
     summary: [...summary.entries()],
     adjustmentReport,
     predictedRemaining,
+    recordItemsOnArchivedCopies,
     rows,
   };
 }
@@ -1012,6 +1119,11 @@ function printReport(plan) {
   }
 
   console.log(
+    `\nrecord_items, которые будут перепривязаны с архивируемых копий на перенесённые строки: ` +
+      `${plan.recordItemsOnArchivedCopies}`,
+  );
+
+  console.log(
     `\n--- Итог: живых legacy-строк под корнем после применения плана (ожидается 0): ${plan.predictedRemaining} ---`,
   );
 
@@ -1071,6 +1183,7 @@ function writePlanJson(plan, path) {
     totalActiveLegacy: plan.totalActiveLegacy,
     totalCopies: plan.totalCopies,
     predictedRemaining: plan.predictedRemaining,
+    recordItemsOnArchivedCopies: plan.recordItemsOnArchivedCopies,
     summary: Object.fromEntries(plan.summary),
     rows: rowsByKey,
   };
@@ -1182,6 +1295,16 @@ async function previewApply(client, plan) {
       errors.push({ row, error: resolved.error });
       continue;
     }
+    // Тот же анти-double-claim бэкстоп, что и в runApply: place_next_to,
+    // чья копия уже архивирована кем-то другим, не должен молча числиться
+    // "готов к переносу".
+    if (resolved.kind === "place_next_to" && resolved.legacy.parent_id === plan.rootId && resolved.copy.status === "archived") {
+      errors.push({
+        row,
+        error: `копия legacy_num=${row.copy_legacy_num} уже архивирована (занята другим действием) — place_next_to невозможен`,
+      });
+      continue;
+    }
     byKind[resolved.kind].push(resolved);
   }
 
@@ -1288,6 +1411,21 @@ async function runApply(client, plan) {
           counters.alreadyDone++;
           continue;
         }
+        if (copy.status === "archived") {
+          // Строка ещё под корнем (не идемпотентный случай выше), но её
+          // копия уже архивирована — кто-то ДРУГОЙ её забрал (move/
+          // match_copy/twins). findDoubleClaimConflicts должен был поймать
+          // это ещё на этапе построения плана — если всё же долетело сюда
+          // (план правили руками, или БД изменилась между dry-run и apply),
+          // не молчим: считаем нерезолвленной строкой, а не тихо пропускаем.
+          counters.unresolved++;
+          unresolvedRows.push({
+            row,
+            error: `копия legacy_num=${row.copy_legacy_num} уже архивирована (занята другим действием) — ` +
+              `place_next_to рядом с ней невозможен`,
+          });
+          continue;
+        }
         const { rows: maxRows } = await client.query(
           `SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM work_types WHERE parent_id = $1`,
           [copy.parent_id],
@@ -1349,6 +1487,38 @@ async function runApply(client, plan) {
     );
     counters.remainingActiveUnderRoot = remainingRows[0].cnt;
 
+    // Финальная проверка: план по замыслу должен свести живые legacy-строки
+    // под корнем к 0 (все они либо move/match_copy/twins/place_next_to,
+    // либо archive/delete_if_unreferenced/merge_into_winner — единственное,
+    // что законно остаётся, это conflict/suggestion/manual/
+    // override_unresolved, которые дорабатываются через overrides.json до
+    // следующего прогона). Ненулевой остаток здесь — сигнал, что план не
+    // готов к проду целиком: ЛУЧШЕ откатить всё и разобраться, чем оставить
+    // БД в частично перенесённом состоянии.
+    if (counters.remainingActiveUnderRoot > 0) {
+      const { rows: leftover } = await client.query(
+        `SELECT id, old_n, name FROM work_types
+          WHERE parent_id = $1 AND source = 'legacy' AND level = 5 AND status = 'active'
+          ORDER BY id`,
+        [plan.rootId],
+      );
+      await client.query("ROLLBACK");
+      console.log(
+        `\n--- ROLLBACK: под корнем остались бы ${counters.remainingActiveUnderRoot} живых legacy-строк ` +
+          `(ожидалось 0) — ВСЯ транзакция отменена, в БД ничего не изменилось ---`,
+      );
+      for (const r of leftover) {
+        console.log(`  id=${r.id} old_n=${r.old_n} "${r.name}"`);
+      }
+      console.log(
+        "\nЭто не то же самое, что просто conflict/suggestion/manual/override_unresolved — план в принципе " +
+          "не сводится к 0. Доработайте scripts/data/legacy_overrides.json (см. секции выше и в --dry-run) " +
+          "и запустите --apply --confirm заново.",
+      );
+      printApplyCounters(counters, unresolvedRows);
+      return { ...counters, rolledBack: true };
+    }
+
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
@@ -1356,6 +1526,11 @@ async function runApply(client, plan) {
   }
 
   console.log("--- Apply выполнен (COMMIT) ---");
+  printApplyCounters(counters, unresolvedRows);
+  return { ...counters, rolledBack: false };
+}
+
+function printApplyCounters(counters, unresolvedRows) {
   console.log(`Перенесено (move/match_copy): ${counters.moved}`);
   console.log(`Перенесено близнецами (move_and_archive_twins): ${counters.twinsMoved}`);
   console.log(`Копий заархивировано (move/match_copy/слот близнецов): ${counters.copiesArchived}`);
@@ -1406,6 +1581,21 @@ async function main() {
   }
   const plan = loadPlanFile(planPath);
 
+  // Та же проверка двойного занятия копии, что и при построении плана
+  // (buildPlan) — перевалидируем здесь на случай, если plan.json правили
+  // руками или он был сгенерирован более старой версией скрипта. Ничего не
+  // трогаем в БД, пока это не пройдено.
+  const doubleClaimConflicts = findDoubleClaimConflicts(plan.rows);
+  if (doubleClaimConflicts.length) {
+    console.error(
+      `Обнаружено ${doubleClaimConflicts.length} случаев двойного занятия копии в загруженном плане — ` +
+        `apply остановлен, БД не тронута:`,
+    );
+    console.error(describeDoubleClaimConflicts(doubleClaimConflicts));
+    process.exitCode = 1;
+    return;
+  }
+
   const client = await pool.connect();
   try {
     await assertOldNColumn(client);
@@ -1413,7 +1603,8 @@ async function main() {
       await previewApply(client, plan);
       return;
     }
-    await runApply(client, plan);
+    const result = await runApply(client, plan);
+    if (result.rolledBack) process.exitCode = 1;
   } finally {
     client.release();
   }
@@ -1480,6 +1671,29 @@ if (isMainModule) {
  * сама строка уже archived; для merge_into_winner — проигравший уже
  * archived. Строки, которые не удалось резолвить, пропускаются с
  * сообщением, не обрывая транзакцию целиком.
+ *
+ * Двойное занятие копии (findDoubleClaimConflicts): проверяется ПОСЛЕ
+ * сборки плана — и в --dry-run (buildPlan бросает исключение, CSV/JSON не
+ * пишутся), и заново в --apply (main() проверяет уже загруженный plan.json
+ * перед BEGIN — на случай ручной правки файла или более старого dry-run).
+ * Одна копия (по copy_legacy_num) не может архивироваться двумя разными
+ * строками (move/match_copy/twins, включая каждого близнеца); place_next_to
+ * сам по себе не конфликтует с другим place_next_to на ту же копию (копия
+ * не архивируется), но конфликтует, если та же копия архивируется где-то
+ * ещё. При --apply --confirm есть и дублирующий бэкстоп на исполнении: если
+ * place_next_to всё же наткнулся на уже архивированную копию (план поменяли
+ * руками, или БД успела измениться) — строка не архивируется молча как
+ * "уже сделано", а попадает в нерезолвленные с явной причиной.
+ *
+ * Финальная проверка --apply --confirm: в конце (до COMMIT) считаются живые
+ * legacy-строки, оставшиеся под корнем. По замыслу их должно быть 0 (все,
+ * что не move/match_copy/twins/place_next_to/archive/
+ * delete_if_unreferenced/merge_into_winner, — это conflict/suggestion/
+ * manual/override_unresolved, которые не должны доходить до --apply
+ * недоработанными). Если остаток не 0 — ROLLBACK ВСЕЙ транзакции (ничего не
+ * коммитится, даже успешно обработанные строки этого прогона), список
+ * оставшихся строк (id/old_n/name) печатается, а сам скрипт завершается с
+ * process.exitCode=1.
  *
  * Что скрипт НЕ трогает: legacy_root (сам корень), 3 архивные legacy-строки
  * (загружаются только status='active'), is_step_item/is_counter_step/

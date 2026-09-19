@@ -2,7 +2,7 @@
  "rows": [
   {"old_n": 144, "action": "match_copy", "copy_name": "Замена стекла в душевой кабине"},
   {"old_n": 216, "action": "match_copy", "copy_name": "Монтаж душевого поддона"},
-  {"old_n": 930, "action": "match_copy", "copy_name": "Штукатурка оконных откосов"},
+  {"old_n": 930, "action": "place_next_to", "copy_name": "Штукатурка оконных откосов"},
   {"old_n": 476, "action": "match_copy", "copy_name": "Погрузка разгрузка строительного материала (вручную)"},
   {"old_n": 731, "action": "place_next_to", "copy_name": "Установка водонагревателя накопительного (бойлер)"},
   {"old_n": 369, "action": "place_next_to", "copy_name": "Монтаж ящика с рубильником (до 100 А) (с подключением жил приходящих и уходящих кабельных линий)", "set_unit": "шт", "set_price": 6000},
