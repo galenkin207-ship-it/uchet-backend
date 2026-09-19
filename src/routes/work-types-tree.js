@@ -54,7 +54,34 @@ function normalizeForCompare(name) {
 // with_real_leaf — множество id узлов, у которых есть хотя бы один
 // настоящий лист где-то в поддереве. Такую группу и в общем списке, и в
 // подсчёте has_children родителя учитываем наравне с настоящими листьями.
-async function fetchChildrenRows(where, params) {
+//
+// includeEmpty (только admin, см. GET /tree) — режим редактирования структуры:
+// контейнеры (level<5) без единого настоящего листа в поддереве НЕ скрываются,
+// а отдаются с is_empty=true; has_children считается по любым неархивным
+// не-шаговым детям (листья или контейнеры, в том числе пустые).
+// containersOnly — только контейнеры (level<5), для селекторов «Расположение».
+async function fetchChildrenRows(where, params, { includeEmpty = false, containersOnly = false } = {}) {
+  const hasChildrenCond = includeEmpty
+    ? `TRUE`
+    : `(
+                   c.level = 5
+                   OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = c.id)
+                 )`;
+  const visibleCond = includeEmpty
+    ? `TRUE`
+    : `(
+          wt.level = 5
+          OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = wt.id)
+        )`;
+  // is_empty — только в режиме includeEmpty и только у контейнеров: настоящего
+  // (не шагового) листа нет нигде в поддереве.
+  const isEmptyCol = includeEmpty
+    ? `
+            (wt.level < 5 AND NOT EXISTS (
+              SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = wt.id
+            )) AS is_empty,`
+    : "";
+  const containersCond = containersOnly ? ` AND wt.level < 5` : "";
   const { rows } = await pool.query(
     `WITH RECURSIVE leaf_ancestors AS (
        SELECT id AS leaf_id, parent_id AS ancestor_id
@@ -70,14 +97,11 @@ async function fetchChildrenRows(where, params) {
      ancestors_with_real_leaf AS (
        SELECT DISTINCT ancestor_id AS id FROM leaf_ancestors
      )
-     SELECT ${TREE_COLUMNS},
+     SELECT ${TREE_COLUMNS},${isEmptyCol}
             EXISTS (
               SELECT 1 FROM work_types c
                WHERE c.parent_id = wt.id AND c.status <> 'archived' AND c.is_step_item = false
-                 AND (
-                   c.level = 5
-                   OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = c.id)
-                 )
+                 AND ${hasChildrenCond}
             ) AS has_children,
             EXISTS (
               SELECT 1 FROM work_types s
@@ -86,10 +110,7 @@ async function fetchChildrenRows(where, params) {
             ) AS has_counter_steps
        FROM work_types wt
       WHERE ${where} AND wt.status <> 'archived' AND wt.is_step_item = false
-        AND (
-          wt.level = 5
-          OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = wt.id)
-        )
+        AND ${visibleCond}${containersCond}
       ORDER BY wt.sort_order, wt.name`,
     params,
   );
@@ -125,15 +146,27 @@ async function expandDuplicateGroups(parentId, parentNameStripped) {
   return result;
 }
 
-// GET /tree?parentId=<id>&type=<строка>
+// GET /tree?parentId=<id>&type=<строка>[&include_empty=1][&containers_only=1]
 // Без parentId — корневой уровень одного каталога (type обязателен).
 // С parentId — непосредственные дети конкретного узла (каталог уже
 // однозначно определён самим узлом, catalog_type не фильтруем).
+//
+// include_empty=1 — режим редактирования структуры, учитывается ТОЛЬКО для
+// role === 'admin' (для остальных ролей параметр молча игнорируется):
+// отдаёт и пустые контейнеры (level<5 без единого живого листа в поддереве)
+// с is_empty=true, has_children — по любым неархивным детям, а
+// expandDuplicateGroups не применяется (админ видит реальные узлы).
+// containers_only=1 — только контейнеры (level<5), для селекторов «Расположение».
+// Без параметров поведение прежнее (пикер записи, мобильная версия).
 workTypesTreeRouter.get(
   "/tree",
   requireAuth,
   asyncHandler(async (req, res) => {
     const { parentId, type } = req.query;
+    const isTruthyFlag = (v) => v === "1" || v === "true";
+    const includeEmpty = isTruthyFlag(req.query.include_empty) && req.user?.role === "admin";
+    const containersOnly = isTruthyFlag(req.query.containers_only);
+    const treeOpts = { includeEmpty, containersOnly };
 
     if (parentId === undefined || parentId === "") {
       if (!type) {
@@ -143,6 +176,7 @@ workTypesTreeRouter.get(
       const rows = await fetchChildrenRows(
         "wt.parent_id IS NULL AND wt.level = 1 AND wt.catalog_type = $1",
         [type],
+        treeOpts,
       );
       return res.json({ items: rows.map((r) => annotateTreeItem(r, req.user)) });
     }
@@ -150,6 +184,13 @@ workTypesTreeRouter.get(
     const id = Number(parentId);
     if (!Number.isInteger(id)) {
       return res.status(400).json({ error: "parentId должен быть целым числом" });
+    }
+
+    if (includeEmpty || containersOnly) {
+      // Реальные узлы без схлопывания одноимённых групп (только для явно
+      // запрошенных режимов; дефолтный путь ниже не меняется).
+      const rows = await fetchChildrenRows("wt.parent_id = $1", [id], treeOpts);
+      return res.json({ items: rows.map((r) => annotateTreeItem(r, req.user)) });
     }
 
     const { rows: parentRows } = await pool.query(
