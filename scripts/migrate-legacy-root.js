@@ -167,6 +167,7 @@ function parseArgs() {
     confirm: rest.includes("--confirm"),
     planPath: getOpt("--plan"),
     selfTest: rest.includes("--self-test"),
+    archiveUnmatched: rest.includes("--archive-unmatched"),
   };
 }
 
@@ -545,6 +546,7 @@ const ROW_DEFAULTS = {
   ref_counts: null,
   override_unit: null,
   override_price: null,
+  override_name: null,
   override_key: null,
   // Заморожены при построении плана для place_next_to (см.
   // buildOverridePlaceNextToRow) — apply использует их как есть, не
@@ -727,6 +729,7 @@ async function buildOverrideDeleteRow(client, legacyRow, ov, overrideKey) {
 }
 
 function buildOverrideMatchCopyRow(legacyRow, copy, ov, overrideKey) {
+  const nameNote = ov.set_name ? ` (имя переопределено: "${ov.set_name}")` : "";
   return {
     ...baseOverrideFields(legacyRow),
     copy_id: copy.id,
@@ -736,9 +739,10 @@ function buildOverrideMatchCopyRow(legacyRow, copy, ov, overrideKey) {
     copy_price: copy.price,
     diff_flags: computeDiffFlags(legacyRow, copy),
     action: "match_copy",
-    notes: `override match_copy: "${ov.copy_name}"`,
+    notes: `override match_copy: "${ov.copy_name}"${nameNote}`,
     override_unit: ov.set_unit ?? null,
     override_price: ov.set_price ?? null,
+    override_name: ov.set_name ?? null,
     override_key: overrideKey,
   };
 }
@@ -755,6 +759,7 @@ function buildOverridePlaceNextToRow(legacyRow, copy, ov, overrideKey) {
       ? ` [копия-якорь уже архивна на момент построения плана (не этим планом — см. заголовок файла); ` +
         `используются её сохранённые parent_id=${copy.parentId}/catalog_type/sbornik_id]`
       : "";
+  const nameNote = ov.set_name ? ` (имя переопределено: "${ov.set_name}")` : ", своё имя сохраняется";
   return {
     ...baseOverrideFields(legacyRow),
     copy_id: copy.id,
@@ -766,10 +771,11 @@ function buildOverridePlaceNextToRow(legacyRow, copy, ov, overrideKey) {
     action: "place_next_to",
     notes:
       `override place_next_to: "${ov.copy_name}" (parent_id/catalog_type/sbornik_id копии — снимок на момент ` +
-      `построения плана, sort_order = max+1 (пересчитывается заново на apply), variant_label=NULL, своё имя и ` +
+      `построения плана, sort_order = max+1 (пересчитывается заново на apply), variant_label=NULL${nameNote}, ` +
       `unit/price сохраняются, копия не архивируется)${archivedWarning}`,
     override_unit: ov.set_unit ?? null,
     override_price: ov.set_price ?? null,
+    override_name: ov.set_name ?? null,
     override_key: overrideKey,
     anchor_parent_id: copy.parentId,
     anchor_catalog_type: copy.catalogType,
@@ -777,16 +783,63 @@ function buildOverridePlaceNextToRow(legacyRow, copy, ov, overrideKey) {
   };
 }
 
+// Резолв legacy-строки для ПОЛНОЙ поправки (с action) — по old_n, иначе по
+// name; если имя само по себе неоднозначно (несколько строк с одинаковым
+// нормализованным текстом — нередкость для сокращений вида "То же, ..." в
+// старых прайсах), можно уточнить парой match_unit+match_price. Чистая
+// функция (без БД, без client) — тестируется в --self-test.
+function resolveOverrideLegacyRow(legacyRows, ov) {
+  if (ov.old_n != null) {
+    const match = legacyRows.find((r) => r.oldN === ov.old_n);
+    if (!match) {
+      return {
+        error:
+          `legacy-строка с old_n=${ov.old_n} не найдена среди активных под корнем ` +
+          `(это ожидаемо, если поправка написана для другого окружения — не обязательно ошибка)`,
+      };
+    }
+    return { legacyRow: match };
+  }
+  if (!ov.name) {
+    return { error: "у строки поправки нет ни old_n, ни name" };
+  }
+  const norm = normalizeName(ov.name);
+  const matches = legacyRows.filter((r) => r.nameNorm === norm);
+  if (matches.length === 0) {
+    return {
+      error:
+        `legacy-строка с именем "${ov.name}" не найдена ` +
+        `(это ожидаемо, если поправка написана для другого окружения — не обязательно ошибка)`,
+    };
+  }
+  if (matches.length === 1) {
+    return { legacyRow: matches[0] };
+  }
+  if (ov.match_unit == null || ov.match_price == null) {
+    return {
+      error:
+        `имя "${ov.name}" неоднозначно (${matches.length} строк: id=${matches.map((m) => m.id).join(",")}) — ` +
+        `укажите old_n, либо match_unit+match_price для уточнения`,
+    };
+  }
+  const unitNorm = normalizeUnit(ov.match_unit);
+  const narrowed = matches.filter((r) => r.unitNorm === unitNorm && pricesEqual(r.price, ov.match_price));
+  if (narrowed.length !== 1) {
+    return {
+      error:
+        `имя "${ov.name}" + match_unit="${ov.match_unit}" + match_price=${ov.match_price}: ` +
+        (narrowed.length === 0
+          ? "не нашли ни одной подходящей строки"
+          : `всё ещё неоднозначно (${narrowed.length} строк: id=${narrowed.map((m) => m.id).join(",")})`),
+    };
+  }
+  return { legacyRow: narrowed[0] };
+}
+
 // Полные поправки (с action) — вынимают строку из обычного пайплайна ДО
 // tier K/дублей/T1-T5. Возвращает { rows, remainingLegacyRows } — вторые
 // идут дальше в обычное сопоставление.
 async function applyOverrides(client, fullOverrides, legacyRows, copies, allCopies) {
-  const byOldN = new Map(legacyRows.map((r) => [r.oldN, r]));
-  const byNameNorm = new Map();
-  for (const r of legacyRows) {
-    if (!byNameNorm.has(r.nameNorm)) byNameNorm.set(r.nameNorm, []);
-    byNameNorm.get(r.nameNorm).push(r);
-  }
   // match_copy резолвится ТОЛЬКО среди active — сама архивирует копию, в
   // архивный слот "заходить" бессмысленно. place_next_to — среди ЛЮБОГО
   // статуса (allCopies) — копия остаётся на месте, читаются только её
@@ -827,29 +880,12 @@ async function applyOverrides(client, fullOverrides, legacyRows, copies, allCopi
   for (const ov of fullOverrides) {
     const overrideKey = ov.old_n != null ? String(ov.old_n) : (ov.name ?? "?");
 
-    let legacyRow = null;
-    let idError = null;
-    if (ov.old_n != null) {
-      legacyRow = byOldN.get(ov.old_n) ?? null;
-      if (!legacyRow) idError = `legacy-строка с old_n=${ov.old_n} не найдена среди активных под корнем`;
-    } else if (ov.name) {
-      const norm = normalizeName(ov.name);
-      const matches = byNameNorm.get(norm) ?? [];
-      if (matches.length === 1) legacyRow = matches[0];
-      else {
-        idError =
-          matches.length === 0
-            ? `legacy-строка с именем "${ov.name}" не найдена`
-            : `имя "${ov.name}" неоднозначно (${matches.length} строк: id=${matches.map((m) => m.id).join(",")})`;
-      }
-    } else {
-      idError = "у строки поправки нет ни old_n, ни name";
-    }
-
-    if (idError) {
-      rows.push(buildOverrideErrorRow(ov, idError, null, overrideKey));
+    const idResult = resolveOverrideLegacyRow(legacyRows, ov);
+    if (idResult.error) {
+      rows.push(buildOverrideErrorRow(ov, idResult.error, null, overrideKey));
       continue;
     }
+    const legacyRow = idResult.legacyRow;
     handledIds.add(legacyRow.id);
 
     if (ov.action === "archive") {
@@ -1002,6 +1038,58 @@ function describeDoubleClaimConflicts(conflicts) {
     .join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// --archive-unmatched: суggestion/manual/conflict-строки без поправки (у них
+// её физически не может быть — override_key ставится только полными
+// поправками, которые вынимают строку из обычного пайплайна ДО T1-T5, см.
+// applyOverrides) архивируются напрямую, но ТОЛЬКО если на них вообще никто
+// не ссылается — 0 record_items, 0 детей (parent_id), 0 step_base_work_type_id.
+// Если хоть одна ссылка есть — строка остаётся как есть (conflict/suggestion/
+// manual), печатается отдельным списком, и --apply --confirm корректно
+// откатится финальной проверкой (по замыслу — это сигнал, что решение по
+// такой строке нужно принимать вручную, а не молча архивировать).
+// ---------------------------------------------------------------------------
+
+const ARCHIVE_UNMATCHED_CANDIDATE_ACTIONS = new Set(["suggestion", "manual", "conflict"]);
+
+// Чистая функция (без БД) — тестируется в --self-test.
+function isArchiveUnmatchedEligible(refs) {
+  return refs.recordItemsCount === 0 && refs.childrenCount === 0 && refs.stepBaseRefsCount === 0;
+}
+
+// Тоже чистая — принимает уже посчитанные refs (Map<legacy_id, refs>), не
+// обращается к БД сама; мутирует подходящие строки rows на месте (action ->
+// "archive_unmatched"). Разделение на "чистое решение" (эта функция,
+// тестируется в --self-test с фиктивными refs) и "поход в БД за refs"
+// (loadArchiveUnmatchedRefs ниже) — тот же приём, что и для двойного
+// занятия копии и для сопоставления по match_unit/match_price.
+function applyArchiveUnmatchedDecisions(rows, refsByLegacyId) {
+  const archived = [];
+  const blocked = [];
+  for (const row of rows) {
+    if (!ARCHIVE_UNMATCHED_CANDIDATE_ACTIONS.has(row.action)) continue;
+    const refs = refsByLegacyId.get(row.legacy_id);
+    if (!refs) continue;
+    if (isArchiveUnmatchedEligible(refs)) {
+      row.action = "archive_unmatched";
+      row.notes = `${row.notes} | --archive-unmatched: ссылок нет (record_items=0, children=0, step_base_refs=0)`;
+      archived.push(row);
+    } else {
+      blocked.push({ row, refs });
+    }
+  }
+  return { archived, blocked };
+}
+
+async function loadArchiveUnmatchedRefs(client, rows) {
+  const refsByLegacyId = new Map();
+  for (const row of rows) {
+    if (!ARCHIVE_UNMATCHED_CANDIDATE_ACTIONS.has(row.action)) continue;
+    refsByLegacyId.set(row.legacy_id, await countReferences(client, row.legacy_id));
+  }
+  return refsByLegacyId;
+}
+
 // node scripts/migrate-legacy-root.js --self-test — проверяет
 // findDoubleClaimConflicts на фикстурах, без БД (нет ни pool.connect(), ни
 // чтения .env) — можно гонять локально/в CI до всякого доступа к серверу.
@@ -1019,8 +1107,28 @@ function selfTestRow(legacyId, action, copyLegacyNum, twins = []) {
   };
 }
 
+// Минимальная legacy-строка (форма, которую возвращает loadLegacyRows) —
+// для тестов resolveOverrideLegacyRow.
+function selfTestLegacyRow(id, oldN, name, unit, price) {
+  return {
+    id,
+    oldN,
+    name,
+    unit,
+    price,
+    recordItemsCount: 0,
+    nameNorm: normalizeName(name),
+    unitNorm: normalizeUnit(unit),
+    nameNormStrict: normalizeNameStrict(name),
+  };
+}
+
 function runSelfTest() {
-  const cases = [
+  const results = []; // { name, ok, detail? }
+  const check = (name, ok, detail) => results.push({ name, ok, detail });
+
+  // --- Двойное занятие копии (findDoubleClaimConflicts) ---
+  const doubleClaimCases = [
     {
       name: "place_next_to + move на одну копию → OK (place_next_to не участвует в занятии копии)",
       rows: [selfTestRow(1, "place_next_to", 100), selfTestRow(2, "move", 100)],
@@ -1050,25 +1158,161 @@ function runSelfTest() {
       expectConflicts: 1,
     },
   ];
+  for (const c of doubleClaimCases) {
+    const conflicts = findDoubleClaimConflicts(c.rows);
+    check(c.name, conflicts.length === c.expectConflicts, `ожидалось конфликтов: ${c.expectConflicts}, получено: ${conflicts.length}`);
+  }
+
+  // --- --archive-unmatched (isArchiveUnmatchedEligible / applyArchiveUnmatchedDecisions) ---
+  check(
+    "archive_unmatched: 0 ссылок отовсюду → eligible",
+    isArchiveUnmatchedEligible({ recordItemsCount: 0, childrenCount: 0, stepBaseRefsCount: 0 }) === true,
+  );
+  check(
+    "archive_unmatched: есть record_items → НЕ eligible",
+    isArchiveUnmatchedEligible({ recordItemsCount: 1, childrenCount: 0, stepBaseRefsCount: 0 }) === false,
+  );
+  check(
+    "archive_unmatched: есть children → НЕ eligible",
+    isArchiveUnmatchedEligible({ recordItemsCount: 0, childrenCount: 1, stepBaseRefsCount: 0 }) === false,
+  );
+  check(
+    "archive_unmatched: есть step_base_refs → НЕ eligible",
+    isArchiveUnmatchedEligible({ recordItemsCount: 0, childrenCount: 0, stepBaseRefsCount: 1 }) === false,
+  );
+  {
+    // Конец-в-конец на фикстурах, без БД: три suggestion/manual/conflict
+    // строки — одна без ссылок (архивируется), одна с ссылками (остаётся,
+    // попадает в blocked), одна вообще не suggestion/manual/conflict
+    // (move — должна быть проигнорирована целиком).
+    const rows = [
+      { legacy_id: 20, action: "suggestion", record_items: 0, notes: "было suggestion" },
+      { legacy_id: 21, action: "manual", record_items: 0, notes: "было manual" },
+      { legacy_id: 22, action: "conflict", record_items: 0, notes: "было conflict" },
+      { legacy_id: 23, action: "move", record_items: 0, notes: "move — не трогать" },
+    ];
+    const refsByLegacyId = new Map([
+      [20, { recordItemsCount: 0, childrenCount: 0, stepBaseRefsCount: 0 }],
+      [21, { recordItemsCount: 2, childrenCount: 0, stepBaseRefsCount: 0 }], // заблокирован
+      [22, { recordItemsCount: 0, childrenCount: 0, stepBaseRefsCount: 0 }],
+      [23, { recordItemsCount: 0, childrenCount: 0, stepBaseRefsCount: 0 }],
+    ]);
+    const { archived, blocked } = applyArchiveUnmatchedDecisions(rows, refsByLegacyId);
+    check(
+      "archive_unmatched: архивирует только suggestion/manual/conflict без ссылок",
+      archived.length === 2 && archived.every((r) => [20, 22].includes(r.legacy_id)),
+      `archived legacy_id=${archived.map((r) => r.legacy_id).join(",")}`,
+    );
+    check(
+      "archive_unmatched: строка со ссылками остаётся в blocked, action не меняется",
+      blocked.length === 1 && blocked[0].row.legacy_id === 21 && blocked[0].row.action === "manual",
+    );
+    check(
+      "archive_unmatched: move-строка не тронута (не suggestion/manual/conflict)",
+      rows.find((r) => r.legacy_id === 23).action === "move",
+    );
+    check(
+      "archive_unmatched: у архивированных action стал archive_unmatched",
+      rows.find((r) => r.legacy_id === 20).action === "archive_unmatched" &&
+        rows.find((r) => r.legacy_id === 22).action === "archive_unmatched",
+    );
+  }
+
+  // --- resolveOverrideLegacyRow: old_n, имя, match_unit+match_price ---
+  {
+    const legacyRows = [
+      selfTestLegacyRow(101, 1001, "Уникальное имя", "шт", 100),
+      selfTestLegacyRow(102, 1002, "То же, ширина до 0,7 м", "п.м.", 400),
+      selfTestLegacyRow(103, 1003, "То же, ширина до 0,7 м", "шт", 250), // тот же nameNorm, другие unit/price
+    ];
+
+    let r = resolveOverrideLegacyRow(legacyRows, { old_n: 1001 });
+    check("resolveOverrideLegacyRow: по old_n находит однозначно", !r.error && r.legacyRow.id === 101);
+
+    r = resolveOverrideLegacyRow(legacyRows, { old_n: 9999 });
+    check("resolveOverrideLegacyRow: несуществующий old_n → error (не найдена)", !!r.error);
+
+    r = resolveOverrideLegacyRow(legacyRows, { name: "Уникальное имя" });
+    check("resolveOverrideLegacyRow: по name, уникальное имя → находит однозначно", !r.error && r.legacyRow.id === 101);
+
+    r = resolveOverrideLegacyRow(legacyRows, { name: "То же, ширина до 0,7 м" });
+    check(
+      "resolveOverrideLegacyRow: имя неоднозначно без match_unit/match_price → error",
+      !!r.error && !r.legacyRow,
+    );
+
+    r = resolveOverrideLegacyRow(legacyRows, {
+      name: "То же, ширина до 0,7 м",
+      match_unit: "п.м.",
+      match_price: 400,
+    });
+    check(
+      "resolveOverrideLegacyRow: имя + match_unit/match_price разрешает неоднозначность",
+      !r.error && r.legacyRow.id === 102,
+      r.error,
+    );
+
+    r = resolveOverrideLegacyRow(legacyRows, {
+      name: "То же, ширина до 0,7 м",
+      match_unit: "шт",
+      match_price: 250,
+    });
+    check(
+      "resolveOverrideLegacyRow: та же неоднозначность, другая пара match_unit/match_price → другая строка",
+      !r.error && r.legacyRow.id === 103,
+      r.error,
+    );
+
+    r = resolveOverrideLegacyRow(legacyRows, {
+      name: "То же, ширина до 0,7 м",
+      match_unit: "т",
+      match_price: 999,
+    });
+    check(
+      "resolveOverrideLegacyRow: match_unit/match_price не подходят ни одной строке → error",
+      !!r.error && !r.legacyRow,
+    );
+  }
+
+  // --- set_name: override_name корректно попадает в строку плана ---
+  {
+    const legacyRow = selfTestLegacyRow(201, 2001, "Старое имя", "шт", 100);
+    const copy = {
+      id: 501, legacyNum: 5001, name: "Имя копии", unit: "шт", price: 100, path: "тест/копия",
+      status: "active", parentId: 900, catalogType: "тест", sbornikId: 900, unitNorm: normalizeUnit("шт"),
+    };
+    const matchCopyRow = buildOverrideMatchCopyRow(legacyRow, copy, { copy_name: "Имя копии", set_name: "Новое имя" }, "2001");
+    check("set_name: match_copy кладёт override_name в строку плана", matchCopyRow.override_name === "Новое имя");
+
+    const placeNextToRow = buildOverridePlaceNextToRow(
+      legacyRow,
+      copy,
+      { copy_name: "Имя копии", set_name: "Новое имя рядом" },
+      "2001",
+    );
+    check(
+      "set_name: place_next_to кладёт override_name в строку плана",
+      placeNextToRow.override_name === "Новое имя рядом",
+    );
+
+    const placeNextToNoSetName = buildOverridePlaceNextToRow(legacyRow, copy, { copy_name: "Имя копии" }, "2001");
+    check(
+      "set_name: place_next_to без set_name — override_name остаётся null (своё имя сохраняется)",
+      placeNextToNoSetName.override_name === null,
+    );
+  }
 
   let failed = 0;
-  for (const c of cases) {
-    const conflicts = findDoubleClaimConflicts(c.rows);
-    const ok = conflicts.length === c.expectConflicts;
-    console.log(
-      `${ok ? "OK  " : "FAIL"} ${c.name} (ожидалось конфликтов: ${c.expectConflicts}, получено: ${conflicts.length})`,
-    );
-    if (!ok) {
-      failed++;
-      if (conflicts.length) console.log(describeDoubleClaimConflicts(conflicts));
-    }
+  for (const r of results) {
+    console.log(`${r.ok ? "OK  " : "FAIL"} ${r.name}${r.detail ? ` (${r.detail})` : ""}`);
+    if (!r.ok) failed++;
   }
 
   if (failed) {
-    console.error(`\nСамотест провален: ${failed} из ${cases.length}.`);
+    console.error(`\nСамотест провален: ${failed} из ${results.length}.`);
     process.exitCode = 1;
   } else {
-    console.log(`\nСамотест пройден: ${cases.length} из ${cases.length}.`);
+    console.log(`\nСамотест пройден: ${results.length} из ${results.length}.`);
   }
 }
 
@@ -1084,9 +1328,10 @@ const RESOLVED_ACTIONS = new Set([
   "archive",
   "delete_if_unreferenced",
   "merge_into_winner",
+  "archive_unmatched",
 ]);
 
-export async function buildPlan(client) {
+export async function buildPlan(client, options = {}) {
   await assertOldNColumn(client);
   const root = await loadRoot(client);
   const legacyRows = await loadLegacyRows(client, root.id);
@@ -1129,6 +1374,18 @@ export async function buildPlan(client) {
     );
   }
 
+  // --archive-unmatched: делается ПОСЛЕ двойного занятия (не влияет на
+  // копии, только на legacy-строки без пары), но ДО applyAdjustments (та
+  // трогает только move-семейство, порядок между ними не важен — оставлено
+  // так для симметрии с чтением плана сверху вниз в отчёте).
+  const archiveUnmatchedResult = { archived: [], blocked: [] };
+  if (options.archiveUnmatched) {
+    const refsByLegacyId = await loadArchiveUnmatchedRefs(client, rows);
+    const result = applyArchiveUnmatchedDecisions(rows, refsByLegacyId);
+    archiveUnmatchedResult.archived = result.archived;
+    archiveUnmatchedResult.blocked = result.blocked;
+  }
+
   const adjustmentReport = applyAdjustments(rows, adjustments);
 
   // record_items, которые будут перепривязаны С АРХИВИРУЕМЫХ КОПИЙ на
@@ -1164,7 +1421,15 @@ export async function buildPlan(client) {
     tierBreakdown.set(row.tier, (tierBreakdown.get(row.tier) ?? 0) + 1);
   }
 
-  const predictedRemaining = rows.filter((r) => !RESOLVED_ACTIONS.has(r.action)).length;
+  // override_unresolved НЕ считаем "живой строкой под корнем": часть таких
+  // строк вообще не соответствует реальной строке в ЭТОЙ БД (old_n/name
+  // поправки написаны для другого окружения — см. resolveOverrideLegacyRow),
+  // а для тех, что соответствуют, — это заведомо требующее ручного решения
+  // исключение, а не то, что --apply должен блокировать через ROLLBACK
+  // (см. ту же логику в финальной проверке runApply).
+  const predictedRemaining = rows.filter(
+    (r) => !RESOLVED_ACTIONS.has(r.action) && r.action !== "override_unresolved",
+  ).length;
 
   return {
     generatedAt: new Date().toISOString(),
@@ -1178,6 +1443,7 @@ export async function buildPlan(client) {
     tierBreakdown: [...tierBreakdown.entries()],
     summary: [...summary.entries()],
     adjustmentReport,
+    archiveUnmatchedResult,
     predictedRemaining,
     recordItemsOnArchivedCopies,
     rows,
@@ -1273,11 +1539,52 @@ function printReport(plan) {
     }
   }
 
+  // Разделяем: legacy_id == null значит поправка вообще не нашла строку в
+  // ЭТОЙ БД (old_n/name написаны для другого окружения, например staging-
+  // only поправки, применяемые к prod-плану) — это ОЖИДАЕМО и не требует
+  // внимания (см. п.4 постановки/заголовок файла); legacy_id != null — это
+  // реальная строка под корнем, для которой поправка не смогла однозначно
+  // выбрать копию — вот это уже требует решения (уточнить copy_name/
+  // match_unit/match_price, или дождаться --archive-unmatched, если
+  // подходит по критериям).
   const unresolvedOverrides = plan.rows.filter((r) => r.action === "override_unresolved");
-  if (unresolvedOverrides.length) {
-    console.log(`\n--- override_unresolved (${unresolvedOverrides.length}) — требуют уточнения, см. выше ---`);
-    for (const r of unresolvedOverrides) {
-      console.log(`  key=${r.override_key} legacy_id=${r.legacy_id ?? "?"} — ${r.notes}`);
+  const notFoundOnThisDb = unresolvedOverrides.filter((r) => r.legacy_id == null);
+  const genuinelyAmbiguous = unresolvedOverrides.filter((r) => r.legacy_id != null);
+  if (notFoundOnThisDb.length) {
+    console.log(
+      `\n--- Поправки без строки в этой БД (${notFoundOnThisDb.length}) — ожидаемо, если написаны для ` +
+        `другого окружения, вниманием можно пренебречь ---`,
+    );
+    for (const r of notFoundOnThisDb) {
+      console.log(`  key=${r.override_key} — ${r.notes}`);
+    }
+  }
+  if (genuinelyAmbiguous.length) {
+    console.log(`\n--- override_unresolved для реальных строк (${genuinelyAmbiguous.length}) — требуют решения ---`);
+    for (const r of genuinelyAmbiguous) {
+      console.log(`  key=${r.override_key} legacy_id=${r.legacy_id} — ${r.notes}`);
+    }
+  }
+
+  if (plan.archiveUnmatchedResult.archived.length || plan.archiveUnmatchedResult.blocked.length) {
+    console.log("\n--- --archive-unmatched ---");
+    const allZero = plan.archiveUnmatchedResult.archived.every((r) => r.record_items === 0);
+    console.log(
+      `Уйдёт в archive_unmatched: ${plan.archiveUnmatchedResult.archived.length} строк ` +
+        `(record_items=0 у всех: ${allZero ? "да" : "НЕТ — проверьте!"})`,
+    );
+    if (plan.archiveUnmatchedResult.blocked.length) {
+      console.log(
+        `НЕ архивируются (есть ссылки — останутся как есть, вызовут ROLLBACK в --apply --confirm): ` +
+          `${plan.archiveUnmatchedResult.blocked.length}`,
+      );
+      for (const b of plan.archiveUnmatchedResult.blocked) {
+        console.log(
+          `  legacy_id=${b.row.legacy_id} old_n=${b.row.old_n} "${b.row.legacy_name}" (action=${b.row.action}): ` +
+            `record_items=${b.refs.recordItemsCount}, children=${b.refs.childrenCount}, ` +
+            `step_base_refs=${b.refs.stepBaseRefsCount}`,
+        );
+      }
     }
   }
 
@@ -1402,7 +1709,20 @@ async function resolveCopyByLegacyNum(client, legacyNum) {
 // без --confirm), и как первый шаг runApply (--confirm). unit/price-
 // override'ы едут вместе со строкой плана (row.override_unit/override_price) —
 // отдельный файл поправок на apply уже не перечитывается.
-async function resolvePlanRow(client, row) {
+async function resolvePlanRow(client, row, options = {}) {
+  if (row.action === "archive_unmatched") {
+    // Двойной gate: dry-run решает, КАКИЕ строки помечены archive_unmatched
+    // (--archive-unmatched при построении плана); apply дополнительно
+    // требует тот же флаг, чтобы их реально заархивировать — без него это
+    // "skip" (строка остаётся живой под корнем и корректно вызовет ROLLBACK
+    // финальной проверкой, если план ожидал 0 остатка).
+    if (!options.archiveUnmatchedEnabled) {
+      return { row, kind: "skip" };
+    }
+    const legacy = await resolveLegacyRow(client, { oldN: row.old_n, name: row.legacy_name, unit: row.legacy_unit });
+    if (legacy.error) return { row, kind: "archive_unmatched", error: legacy.error };
+    return { row, kind: "archive_unmatched", legacy };
+  }
   if (row.action === "move" || row.action === "match_copy") {
     const legacy = await resolveLegacyRow(client, { oldN: row.old_n, name: row.legacy_name, unit: row.legacy_unit });
     if (legacy.error) return { row, kind: "move", error: legacy.error };
@@ -1460,11 +1780,14 @@ async function resolvePlanRow(client, row) {
   return { row, kind: "skip" };
 }
 
-async function previewApply(client, plan) {
-  const byKind = { move: [], twins: [], place_next_to: [], archive: [], delete_if_unreferenced: [], merge: [], skip: [] };
+async function previewApply(client, plan, options = {}) {
+  const byKind = {
+    move: [], twins: [], place_next_to: [], archive: [], delete_if_unreferenced: [],
+    archive_unmatched: [], merge: [], skip: [],
+  };
   const errors = [];
   for (const row of plan.rows) {
-    const resolved = await resolvePlanRow(client, row);
+    const resolved = await resolvePlanRow(client, row, options);
     if (resolved.error) {
       errors.push({ row, error: resolved.error });
       continue;
@@ -1479,8 +1802,17 @@ async function previewApply(client, plan) {
   console.log(`place_next_to (резолвлены): ${byKind.place_next_to.length}`);
   console.log(`archive (резолвлены): ${byKind.archive.length}`);
   console.log(`delete_if_unreferenced (резолвлены): ${byKind.delete_if_unreferenced.length}`);
+  console.log(`archive_unmatched (резолвлены): ${byKind.archive_unmatched.length}`);
   console.log(`merge_into_winner (резолвлены): ${byKind.merge.length}`);
   console.log(`conflict/suggestion/manual/override_unresolved (не трогаются): ${byKind.skip.length}`);
+  const archiveUnmatchedRowsInPlan = plan.rows.filter((r) => r.action === "archive_unmatched");
+  if (archiveUnmatchedRowsInPlan.length && !options.archiveUnmatchedEnabled) {
+    console.log(
+      `\nВНИМАНИЕ: в плане есть ${archiveUnmatchedRowsInPlan.length} строк(и) archive_unmatched, но флаг ` +
+        `--archive-unmatched не передан этому запуску — они попали в skip (не будут заархивированы) и, если план ` +
+        `ожидал 0 остатка, --confirm откатится финальной проверкой. Передайте --archive-unmatched.`,
+    );
+  }
   if (errors.length) {
     console.log(`\nНЕ УДАЛОСЬ РЕЗОЛВИТЬ (${errors.length}) — --confirm их тоже пропустит и сообщит:`);
     for (const e of errors.slice(0, 20)) {
@@ -1502,7 +1834,7 @@ async function applyMoveUpdate(client, legacyId, copySnapshot, row) {
   ];
   const values = [
     copySnapshot.parent_id, copySnapshot.catalog_type, copySnapshot.sbornik_id,
-    copySnapshot.sort_order, copySnapshot.name, copySnapshot.variant_label, copySnapshot.legacy_num,
+    copySnapshot.sort_order, row.override_name ?? copySnapshot.name, copySnapshot.variant_label, copySnapshot.legacy_num,
   ];
   let idx = values.length + 1;
   if (row.override_unit != null) { setParts.push(`unit = $${idx}`); values.push(row.override_unit); idx++; }
@@ -1520,11 +1852,11 @@ async function archiveCopyAndRelink(client, legacyId, copyId) {
   return rowCount;
 }
 
-async function runApply(client, plan) {
+async function runApply(client, plan, options = {}) {
   const counters = {
     moved: 0, copiesArchived: 0, recordItemsRelinked: 0, merged: 0,
     placedNextTo: 0, archivedOverride: 0, deleted: 0, archivedInsteadOfDeleted: 0,
-    twinsMoved: 0, twinCopiesArchived: 0,
+    twinsMoved: 0, twinCopiesArchived: 0, archivedUnmatched: 0,
     alreadyDone: 0, unresolved: 0,
   };
   const unresolvedRows = [];
@@ -1532,7 +1864,7 @@ async function runApply(client, plan) {
   await client.query("BEGIN");
   try {
     for (const row of plan.rows) {
-      const resolved = await resolvePlanRow(client, row);
+      const resolved = await resolvePlanRow(client, row, options);
       if (resolved.error) {
         counters.unresolved++;
         unresolvedRows.push({ row, error: resolved.error });
@@ -1588,6 +1920,7 @@ async function runApply(client, plan) {
         ];
         const values = [row.anchor_parent_id, row.anchor_catalog_type, row.anchor_sbornik_id, maxRows[0].next];
         let idx = values.length + 1;
+        if (row.override_name != null) { setParts.push(`name = $${idx}`); values.push(row.override_name); idx++; }
         if (row.override_unit != null) { setParts.push(`unit = $${idx}`); values.push(row.override_unit); idx++; }
         if (row.override_price != null) { setParts.push(`price = $${idx}`); values.push(row.override_price); idx++; }
         values.push(legacy.id);
@@ -1620,6 +1953,14 @@ async function runApply(client, plan) {
               `children=${refs.childrenCount}, step_base_refs=${refs.stepBaseRefsCount}) — заархивирована вместо удаления`,
           );
         }
+      } else if (resolved.kind === "archive_unmatched") {
+        const { legacy } = resolved;
+        if (legacy.status === "archived") {
+          counters.alreadyDone++;
+          continue;
+        }
+        await client.query(`UPDATE work_types SET status = 'archived', archived_at = now() WHERE id = $1`, [legacy.id]);
+        counters.archivedUnmatched++;
       } else if (resolved.kind === "merge") {
         const { loser, winner } = resolved;
         if (loser.status === "archived") {
@@ -1629,30 +1970,48 @@ async function runApply(client, plan) {
         counters.recordItemsRelinked += await archiveCopyAndRelink(client, winner.id, loser.id);
         counters.merged++;
       }
-      // kind === "skip" (conflict/suggestion/manual/override_unresolved) — ничего не делаем.
+      // kind === "skip" (conflict/suggestion/manual/override_unresolved, или
+      // archive_unmatched без --archive-unmatched на этом прогоне apply) —
+      // ничего не делаем.
     }
+
+    // override_unresolved не считается "живой строкой под корнем" в финальной
+    // проверке — та же логика, что и в buildPlan/predictedRemaining (см. там):
+    // часть таких строк вообще не из этой БД (old_n/name для другого
+    // окружения), а для тех, что есть, — это заведомо требующее ручного
+    // решения исключение, а не то, на чём --apply должен откатывать всю
+    // транзакцию. Используем legacy_id прямо из плана — безопасно, т.к.
+    // dbName уже сверен с текущим окружением (см. main()), id стабильны в
+    // пределах одной БД.
+    const overrideUnresolvedIds = plan.rows
+      .filter((r) => r.action === "override_unresolved" && r.legacy_id != null)
+      .map((r) => r.legacy_id);
 
     const { rows: remainingRows } = await client.query(
       `SELECT count(*)::int AS cnt FROM work_types
-        WHERE parent_id = $1 AND source = 'legacy' AND level = 5 AND status = 'active'`,
-      [plan.rootId],
+        WHERE parent_id = $1 AND source = 'legacy' AND level = 5 AND status = 'active'
+          AND id <> ALL($2::int[])`,
+      [plan.rootId, overrideUnresolvedIds],
     );
     counters.remainingActiveUnderRoot = remainingRows[0].cnt;
 
     // Финальная проверка: план по замыслу должен свести живые legacy-строки
     // под корнем к 0 (все они либо move/match_copy/twins/place_next_to,
-    // либо archive/delete_if_unreferenced/merge_into_winner — единственное,
-    // что законно остаётся, это conflict/suggestion/manual/
-    // override_unresolved, которые дорабатываются через overrides.json до
-    // следующего прогона). Ненулевой остаток здесь — сигнал, что план не
-    // готов к проду целиком: ЛУЧШЕ откатить всё и разобраться, чем оставить
-    // БД в частично перенесённом состоянии.
+    // либо archive/delete_if_unreferenced/merge_into_winner/
+    // archive_unmatched — единственное, что законно остаётся, это
+    // conflict/suggestion/manual, которые дорабатываются через
+    // overrides.json/--archive-unmatched до следующего прогона, и
+    // override_unresolved, исключённые из подсчёта выше). Ненулевой
+    // остаток здесь — сигнал, что план не готов к проду целиком: ЛУЧШЕ
+    // откатить всё и разобраться, чем оставить БД в частично перенесённом
+    // состоянии.
     if (counters.remainingActiveUnderRoot > 0) {
       const { rows: leftover } = await client.query(
         `SELECT id, old_n, name FROM work_types
           WHERE parent_id = $1 AND source = 'legacy' AND level = 5 AND status = 'active'
+            AND id <> ALL($2::int[])
           ORDER BY id`,
-        [plan.rootId],
+        [plan.rootId, overrideUnresolvedIds],
       );
       await client.query("ROLLBACK");
       console.log(
@@ -1691,6 +2050,7 @@ function printApplyCounters(counters, unresolvedRows) {
   console.log(`Заархивировано (override archive): ${counters.archivedOverride}`);
   console.log(`Удалено физически (delete_if_unreferenced): ${counters.deleted}`);
   console.log(`Заархивировано вместо удаления (были ссылки): ${counters.archivedInsteadOfDeleted}`);
+  console.log(`Заархивировано (--archive-unmatched): ${counters.archivedUnmatched}`);
   console.log(`record_items перепривязано: ${counters.recordItemsRelinked}`);
   console.log(`Дублей смёржено (merge_into_winner): ${counters.merged}`);
   console.log(`Уже было сделано раньше (пропущено идемпотентно): ${counters.alreadyDone}`);
@@ -1711,7 +2071,7 @@ function printApplyCounters(counters, unresolvedRows) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { apply, confirm, planPath, selfTest } = parseArgs();
+  const { apply, confirm, planPath, selfTest, archiveUnmatched } = parseArgs();
 
   if (selfTest) {
     runSelfTest();
@@ -1726,7 +2086,7 @@ async function main() {
     removeStalePlanFiles();
     const client = await pool.connect();
     try {
-      const plan = await buildPlan(client);
+      const plan = await buildPlan(client, { archiveUnmatched });
       printReport(plan);
       writeCsv(plan.rows, PLAN_CSV_PATH);
       writePlanJson(plan, PLAN_JSON_PATH);
@@ -1783,14 +2143,16 @@ async function main() {
     return;
   }
 
+  const applyOptions = { archiveUnmatchedEnabled: archiveUnmatched };
+
   const client = await pool.connect();
   try {
     await assertOldNColumn(client);
     if (!confirm) {
-      await previewApply(client, plan);
+      await previewApply(client, plan, applyOptions);
       return;
     }
-    const result = await runApply(client, plan);
+    const result = await runApply(client, plan, applyOptions);
     if (result.rolledBack) process.exitCode = 1;
   } finally {
     client.release();
@@ -1821,28 +2183,65 @@ if (isMainModule) {
  *   node scripts/migrate-legacy-root.js --apply --plan /tmp/legacy_plan.json --confirm
  *     (одна транзакция, реально переносит/архивирует/удаляет/перепривязывает)
  *
+ *   node scripts/migrate-legacy-root.js --dry-run --archive-unmatched
+ *     (то же + помечает archive_unmatched подходящие suggestion/manual/
+ *     conflict-строки без ссылок, см. ниже)
+ *
+ *   node scripts/migrate-legacy-root.js --apply --plan /tmp/legacy_plan.json \
+ *     --confirm --archive-unmatched
+ *     (--archive-unmatched нужен И на dry-run, И на apply — apply не
+ *     заархивирует archive_unmatched-строки без явного флага на этом
+ *     конкретном прогоне, даже если план был построен с ним)
+ *
  * scripts/data/legacy_overrides.json — { "rows": [...] }, два вида строк
  * (см. подробный разбор в заголовке файла):
  *   - с action: match_copy | place_next_to | archive | delete_if_unreferenced
- *     — { old_n?, name?, action, copy_name?, set_unit?, set_price? };
- *     адресация legacy-строки — old_n, иначе точное совпадение name;
- *     адресация копии — copy_name (точное нормализованное совпадение; 0 или
- *     >1 совпадений — строка попадает в отчёт как override_unresolved со
- *     списком найденных вариантов, ничего не выбирается автоматически).
- *     match_copy ищет копию ТОЛЬКО среди active (сама архивирует её —
- *     в архивный слот "заходить" бессмысленно). place_next_to ищет среди
- *     ЛЮБОГО статуса (active и archived) и читает parent_id/catalog_type/
- *     sbornik_id копии ОДИН РАЗ при построении плана — эти поля не меняются
- *     архивацией, поэтому дальше place_next_to от статуса копии не зависит
- *     вообще (см. правило про двойное занятие ниже); если найденная копия
- *     уже архивна на момент построения плана и у неё нет parent_id — это
- *     единственный случай, когда place_next_to всё же падает в
- *     override_unresolved (разместить рядом буквально не с чем).
+ *     — { old_n?, name?, match_unit?, match_price?, action, copy_name?,
+ *     set_unit?, set_price?, set_name? }. Адресация legacy-строки: old_n,
+ *     иначе точное совпадение name; если по одному name находится НЕСКОЛЬКО
+ *     строк (нередкость для сокращений вида "То же, ..." в старых прайсах,
+ *     повторяющихся в разных местах с разной unit/price) — уточняется парой
+ *     match_unit+match_price (после нормализации, должна остаться ровно
+ *     одна строка, иначе override_unresolved). Адресация копии — copy_name
+ *     (точное нормализованное совпадение; 0 или >1 совпадений — строка
+ *     попадает в отчёт как override_unresolved со списком найденных
+ *     вариантов, ничего не выбирается автоматически). match_copy ищет
+ *     копию ТОЛЬКО среди active (сама архивирует её — в архивный слот
+ *     "заходить" бессмысленно). place_next_to ищет среди ЛЮБОГО статуса
+ *     (active и archived) и читает parent_id/catalog_type/sbornik_id копии
+ *     ОДИН РАЗ при построении плана — эти поля не меняются архивацией,
+ *     поэтому дальше place_next_to от статуса копии не зависит вообще (см.
+ *     правило про двойное занятие ниже); если найденная копия уже архивна
+ *     на момент построения плана и у неё нет parent_id — это единственный
+ *     случай, когда place_next_to всё же падает в override_unresolved
+ *     (разместить рядом буквально не с чем). set_name (для match_copy и
+ *     place_next_to) переименовывает саму legacy-строку — без него
+ *     match_copy берёт имя копии как обычно, а place_next_to сохраняет
+ *     собственное имя строки.
  *   - без action: { old_n, set_unit?, set_price? } — поправка ПОВЕРХ
  *     результата обычного автосопоставления (ожидается action=move/
  *     match_copy/move_and_archive_twins); если строка свелась к чему-то
  *     другому — поправка не применяется, это видно в отчёте
  *     ("Поправки к автоплану").
+ *
+ * Поправки, чей old_n/name не находится в ТЕКУЩЕЙ БД (например, поправка
+ * написана для staging, а --dry-run идёт на проде) — это не ошибка сама по
+ * себе: строка попадает в override_unresolved, но в отчёте отдельным
+ * списком "без строки в этой БД" (и не считается в predictedRemaining —
+ * см. ниже), а не вперемешку со строками, которые реально требуют решения.
+ *
+ * --archive-unmatched: suggestion/manual/conflict-строки, у которых нет
+ * поправки (физически не может быть — полная поправка вынимает строку из
+ * обычного пайплайна ДО T1-T5, см. applyOverrides), архивируются напрямую —
+ * но только если на них вообще ничего не ссылается (0 record_items, 0
+ * детей work_types.parent_id, 0 work_types.step_base_work_type_id).
+ * Строка хоть с одной ссылкой остаётся как есть (conflict/suggestion/
+ * manual) и печатается отдельным списком — --apply --confirm корректно
+ * откатится финальной проверкой, если план всё равно ожидал 0 остатка.
+ * Флаг нужен отдельно и на --dry-run (решает, КАКИЕ строки получат
+ * action=archive_unmatched в плане), и на --apply (без него на КОНКРЕТНОМ
+ * прогоне apply такие строки просто пропускаются, оставаясь живыми под
+ * корнем, — двойной явный opt-in для группового архивирования).
  *
  * Правило близнецов (move_and_archive_twins): несколько кандидатов-копий на
  * тирах K/T1-T4, но все с одинаковыми нормализованными name/unit/price И
@@ -1889,15 +2288,24 @@ if (isMainModule) {
  * place_next_to против move/match_copy/twins — она давала ложные
  * срабатывания именно в этом законном случае и была убрана.)
  *
- * Самотест без БД: node scripts/migrate-legacy-root.js --self-test —
- * проверяет findDoubleClaimConflicts на фикстурах (без pool.connect()).
+ * Самотест без БД: node scripts/migrate-legacy-root.js --self-test — без
+ * pool.connect(), на фикстурах: findDoubleClaimConflicts (двойное занятие
+ * копии), isArchiveUnmatchedEligible/applyArchiveUnmatchedDecisions
+ * (--archive-unmatched), resolveOverrideLegacyRow (old_n/name/
+ * match_unit+match_price) и override_name (set_name) в
+ * buildOverrideMatchCopyRow/buildOverridePlaceNextToRow.
  *
  * Финальная проверка --apply --confirm: в конце (до COMMIT) считаются живые
- * legacy-строки, оставшиеся под корнем. По замыслу их должно быть 0 (все,
- * что не move/match_copy/twins/place_next_to/archive/
- * delete_if_unreferenced/merge_into_winner, — это conflict/suggestion/
- * manual/override_unresolved, которые не должны доходить до --apply
- * недоработанными). Если остаток не 0 — ROLLBACK ВСЕЙ транзакции (ничего не
+ * legacy-строки, оставшиеся под корнем — ИСКЛЮЧАЯ те, чей legacy_id в плане
+ * значится как override_unresolved (та же логика, что и в predictedRemaining
+ * при построении плана, см. buildPlan — не всё, что попало в
+ * override_unresolved, соответствует реальной строке в этой БД, а то, что
+ * соответствует, требует ручного решения, а не ROLLBACK). По замыслу
+ * остаток должен быть 0 (всё остальное — move/match_copy/twins/
+ * place_next_to/archive/delete_if_unreferenced/merge_into_winner/
+ * archive_unmatched — либо перенесено/заархивировано, либо оставлено
+ * осознанно через override_unresolved). Если остаток (без учёта
+ * override_unresolved) не 0 — ROLLBACK ВСЕЙ транзакции (ничего не
  * коммитится, даже успешно обработанные строки этого прогона), список
  * оставшихся строк (id/old_n/name) печатается, а сам скрипт завершается с
  * process.exitCode=1.
