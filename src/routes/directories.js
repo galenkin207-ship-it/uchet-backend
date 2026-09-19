@@ -11,6 +11,7 @@ import {
   checkGesnCodeUnique,
   buildLeafDetail,
   archiveWorkType,
+  respondWorkTypeDbError,
 } from "./work-types-shared.js";
 
 // Небольшой генератор CRUD-роутера для простых справочников вида
@@ -465,7 +466,8 @@ export const workTypesRouter = makeDirectoryRouter({
 });
 
 // POST /api/work-types — создание нового листа (level=5) дерева видов работ.
-// source='manual' — как и у узлов, создаваемых вручную через /nodes.
+// source='manual' — листья, созданные вручную (контейнеры через /nodes
+// создаются с source='user_added' и в плоский справочник не попадают).
 // Роли admin+curator (шире, чем остальной CRUD этого справочника, который
 // admin-only) — согласовано с остальными новыми эндпоинтами каскадного
 // редактирования дерева.
@@ -492,6 +494,10 @@ workTypesRouter.post(
     }
     if (!name || !String(name).trim()) {
       return res.status(400).json({ error: "Укажите название" });
+    }
+    // unit — NOT NULL в work_types: без единицы INSERT упал бы с 23502.
+    if (unit == null || !String(unit).trim()) {
+      return res.status(400).json({ error: "Укажите единицу измерения" });
     }
     const priceError = validatePrice(price);
     if (priceError) return res.status(400).json({ error: priceError });
@@ -539,7 +545,7 @@ workTypesRouter.post(
           sbornikId,
           String(name).trim(),
           variant_label || null,
-          unit || null,
+          String(unit).trim(),
           price ?? 0,
           has_price !== false,
           labor_hours ?? null,
@@ -553,6 +559,7 @@ workTypesRouter.post(
       if (err.code === "23505" && err.constraint === "idx_work_types_sbornik_gesn_code") {
         return res.status(409).json({ error: `Код ГЭСН «${trimmedGesnCode}» уже используется в этом сборнике` });
       }
+      if (respondWorkTypeDbError(err, res, { duplicateMessage: "Такая позиция уже есть" })) return;
       throw err;
     }
 

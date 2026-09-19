@@ -10,6 +10,7 @@ import {
   checkGesnCodeUnique,
   buildLeafDetail,
   archiveWorkType,
+  respondWorkTypeDbError,
 } from "./work-types-shared.js";
 
 // Роутер поверх древовидной структуры work_types (level, parent_id,
@@ -442,6 +443,18 @@ workTypesTreeRouter.patch(
         await client.query("ROLLBACK");
         return res.status(400).json({ error: "Укажите название" });
       }
+      // unit/price/has_price/sort_order — NOT NULL: явный null в теле иначе
+      // дошёл бы до UPDATE и упал бы с 23502 (validatePrice(null) пропускает).
+      if ("unit" in body && (body.unit == null || !String(body.unit).trim())) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "Укажите единицу измерения" });
+      }
+      for (const field of ["price", "has_price", "sort_order"]) {
+        if (field in body && body[field] == null) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "Не заполнено обязательное поле" });
+        }
+      }
 
       let newParentId = current.parent_id;
       let newSbornikId = current.sbornik_id;
@@ -536,6 +549,7 @@ workTypesTreeRouter.patch(
         if (err.code === "23505" && err.constraint === "idx_work_types_sbornik_gesn_code") {
           return res.status(409).json({ error: `Код ГЭСН «${finalGesnCode}» уже используется в этом сборнике` });
         }
+        if (respondWorkTypeDbError(err, res, { duplicateMessage: "Такая позиция уже есть" })) return;
         throw err;
       }
 
@@ -612,25 +626,37 @@ workTypesTreeRouter.post(
     });
     if (nameError) return res.status(409).json({ error: nameError });
 
-    const { rows: insertedRows } = await pool.query(
-      `INSERT INTO work_types (parent_id, level, catalog_type, sbornik_id, name, sort_order, source, status)
-       VALUES ($1,$2,$3,$4,$5,$6,'manual','active')
-       RETURNING id`,
-      [
-        parent ? parent.id : null,
-        level,
-        resolvedCatalogType,
-        parent ? parent.sbornik_id : null,
-        String(name).trim(),
-        sort_order ?? 0,
-      ],
-    );
-    const newId = insertedRows[0].id;
+    // unit/price NOT NULL (базовая схема таблицы), has_price — как у всех
+    // существующих контейнеров и у импортёров каталога: '-', 0, false.
+    // source='user_added', а НЕ 'manual': плоский справочник мастеров
+    // (GET /api/work-types) берёт source IN ('legacy','manual'), контейнеры
+    // в нём быть не должны.
+    let newId;
+    try {
+      const { rows: insertedRows } = await pool.query(
+        `INSERT INTO work_types
+           (parent_id, level, catalog_type, sbornik_id, name, unit, price, has_price, sort_order, source, status)
+         VALUES ($1,$2,$3,$4,$5,'-',0,false,$6,'user_added','active')
+         RETURNING id`,
+        [
+          parent ? parent.id : null,
+          level,
+          resolvedCatalogType,
+          parent ? parent.sbornik_id : null,
+          String(name).trim(),
+          sort_order ?? 0,
+        ],
+      );
+      newId = insertedRows[0].id;
 
-    // Корень (level=1) — свой собственный sbornik_id (см. миграция 025),
-    // известен только после вставки (нужен собственный id).
-    if (level === 1) {
-      await pool.query(`UPDATE work_types SET sbornik_id = $1 WHERE id = $1`, [newId]);
+      // Корень (level=1) — свой собственный sbornik_id (см. миграция 025),
+      // известен только после вставки (нужен собственный id).
+      if (level === 1) {
+        await pool.query(`UPDATE work_types SET sbornik_id = $1 WHERE id = $1`, [newId]);
+      }
+    } catch (err) {
+      if (respondWorkTypeDbError(err, res, { duplicateMessage: "Раздел с таким названием уже есть" })) return;
+      throw err;
     }
 
     const { rows: finalRows } = await pool.query(`SELECT ${TREE_COLUMNS} FROM work_types WHERE id = $1`, [newId]);
@@ -712,19 +738,28 @@ workTypesTreeRouter.patch(
       idx += 1;
     }
     if ("sort_order" in body) {
+      if (body.sort_order == null) {
+        return res.status(400).json({ error: "Не заполнено обязательное поле" });
+      }
       setParts.push(`sort_order = $${idx}`);
       values.push(body.sort_order);
       idx += 1;
     }
     values.push(id);
 
-    const { rows } = await pool.query(
-      `UPDATE work_types SET ${setParts.join(", ")}
-       WHERE id = $${idx}
-       RETURNING id, parent_id, level, catalog_type, sbornik_id, name, sort_order, status`,
-      values,
-    );
-    const updated = rows[0];
+    let updated;
+    try {
+      const { rows } = await pool.query(
+        `UPDATE work_types SET ${setParts.join(", ")}
+         WHERE id = $${idx}
+         RETURNING id, parent_id, level, catalog_type, sbornik_id, name, sort_order, status`,
+        values,
+      );
+      updated = rows[0];
+    } catch (err) {
+      if (respondWorkTypeDbError(err, res, { duplicateMessage: "Раздел с таким названием уже есть" })) return;
+      throw err;
+    }
 
     await insertAuditLog(pool, {
       entityType: "work_type",

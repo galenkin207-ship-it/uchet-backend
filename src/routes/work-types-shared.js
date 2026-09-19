@@ -86,6 +86,26 @@ export async function checkGesnCodeUnique(executor, sbornikId, gesnCode, exclude
   return null;
 }
 
+// Ошибки Postgres при записи в work_types → 400/409 с русским сообщением
+// вместо 500: 23502 (NOT NULL) и 23505 (unique). Возвращает true, если
+// ошибка обработана и ответ уже отправлен; иначе false — вызывающий
+// пробрасывает err дальше как раньше. Специфичные проверки (например,
+// idx_work_types_sbornik_gesn_code с текстом про код ГЭСН) вызывающий
+// делает ДО этого хелпера.
+export function respondWorkTypeDbError(err, res, { duplicateMessage }) {
+  if (err.code === "23502") {
+    console.warn(`work_types: NOT NULL violation, column=${err.column}`);
+    res.status(400).json({ error: "Не заполнено обязательное поле" });
+    return true;
+  }
+  if (err.code === "23505") {
+    console.warn(`work_types: unique violation, constraint=${err.constraint}`);
+    res.status(409).json({ error: duplicateMessage });
+    return true;
+  }
+  return false;
+}
+
 // Цепочка предков листа от корня (level 1) вниз, не включая сам лист.
 export async function getAncestorChain(executor, leafId) {
   const { rows } = await executor.query(
