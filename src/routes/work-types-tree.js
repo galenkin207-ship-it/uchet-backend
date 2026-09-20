@@ -32,6 +32,49 @@ const TREE_COLUMNS = `
   labor_hours, variant_label, source
 `;
 
+// Колонки листа для only_leaf: формат узла /tree плюс is_counter_step.
+const ONLY_LEAF_COLUMNS = `
+  c.id, c.name, c.level, c.parent_id, c.unit, c.price, c.has_price, c.gesn_code, c.catalog_type,
+  c.is_step_item, c.is_counter_step, c.step_unit_label, c.step_base_work_type_id,
+  c.work_composition, c.labor_hours, c.variant_label, c.source
+`;
+
+// only_leaf для групп (level=4) в списке узлов: единственный неархивный
+// нешаговый ребёнок-лист (level=5) отдаётся прямо в узле группы, чтобы клиент
+// сразу показал карточку позиции, а не стрелку, которая схлопывается после
+// загрузки детей. «Нешаговый» — как в has_children/списке детей: шаговые строки
+// клиент не видит. Один запрос на весь список (GROUP BY parent_id HAVING
+// count(*)=1), не по запросу на группу. У остальных групп only_leaf = null;
+// у узлов другого level поля нет. Формат — узел листа /tree (без can_edit —
+// его добавляет annotateTreeItem).
+async function attachOnlyLeaf(rows) {
+  const groupIds = rows.filter((r) => r.level === 4).map((r) => r.id);
+  if (!groupIds.length) return rows;
+
+  const { rows: leafRows } = await pool.query(
+    `SELECT ${ONLY_LEAF_COLUMNS},
+            EXISTS (
+              SELECT 1 FROM work_types s
+               WHERE s.step_base_work_type_id = c.id AND s.is_counter_step = true
+                 AND s.status <> 'archived'
+            ) AS has_counter_steps
+       FROM work_types c
+       JOIN (
+         SELECT parent_id
+           FROM work_types
+          WHERE parent_id = ANY($1) AND status <> 'archived' AND is_step_item = false
+          GROUP BY parent_id
+         HAVING count(*) = 1
+       ) solo ON solo.parent_id = c.parent_id
+      WHERE c.status <> 'archived' AND c.is_step_item = false AND c.level = 5`,
+    [groupIds],
+  );
+  const byParent = new Map(
+    leafRows.map((l) => [l.parent_id, { ...l, has_children: false }]),
+  );
+  return rows.map((r) => (r.level === 4 ? { ...r, only_leaf: byParent.get(r.id) ?? null } : r));
+}
+
 // Тот же паттерн ведущего кода, что и в миграции 023
 // (напр. "01-02-088 " или "15-06-001 " перед текстом таблицы/раздела).
 const CODE_PREFIX_RE = /^\d{2}(-\d{2,3}){1,2}\s+/;
@@ -123,6 +166,9 @@ async function fetchChildrenRows(where, params, { includeEmpty = false, containe
       ORDER BY wt.sort_order, wt.name`,
     queryParams,
   );
+  // only_leaf — только в обычном режиме пикера; справочник (include_empty,
+  // containers_only, level) получает узлы как раньше.
+  if (!includeEmpty && !containersOnly && level == null) return attachOnlyLeaf(rows);
   return rows;
 }
 
@@ -256,6 +302,7 @@ workTypesTreeRouter.get(
 // в отличие от операций над листьями.
 function annotateTreeItem(row, user) {
   const item = { ...row, can_edit: isAdminLike(user) };
+  if (row.only_leaf) item.only_leaf = { ...row.only_leaf, can_edit: isAdminLike(user) };
   if (row.level < 5) {
     item.can_edit_node = !!user && user.role === "admin";
   }
