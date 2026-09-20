@@ -230,8 +230,8 @@ async function restoreRequest(id, snapshot) {
       // Заявка ещё в базе (правка или мягкое удаление) — откатываем поля.
       await client.query(
         `UPDATE requests SET status=$1, resolved_name=$2, resolved_unit=$3, resolved_price=$4,
-           reject_reason=$5, resolved_at=$6, rejected_at=$7
-         WHERE id=$8`,
+           reject_reason=$5, resolved_at=$6, rejected_at=$7, response_message=$8
+         WHERE id=$9`,
         [
           snapshot.status,
           snapshot.resolved_name,
@@ -240,6 +240,7 @@ async function restoreRequest(id, snapshot) {
           snapshot.reject_reason,
           snapshot.resolved_at,
           snapshot.rejected_at,
+          snapshot.response_message ?? null,
           id,
         ],
       );
@@ -265,8 +266,8 @@ async function restoreRequest(id, snapshot) {
       // владение такой восстановленной заявкой определится по ФИО (см. requests.js).
       await client.query(
         `INSERT INTO requests (id, text, submitted_by, submitted_by_user_id, status, resolved_name, resolved_unit,
-            resolved_price, reject_reason, created_at, resolved_at, rejected_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+            resolved_price, reject_reason, created_at, resolved_at, rejected_at, response_message)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
         [
           id,
           snapshot.text,
@@ -280,6 +281,7 @@ async function restoreRequest(id, snapshot) {
           snapshot.created_at,
           snapshot.resolved_at,
           snapshot.rejected_at,
+          snapshot.response_message ?? null,
         ],
       );
       await client.query(

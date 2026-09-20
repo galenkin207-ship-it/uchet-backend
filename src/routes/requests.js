@@ -4,7 +4,6 @@ import { requireAuth, requireRole } from "../auth.js";
 import { sendPushToRole, sendPushToUser } from "../push-notify.js";
 import { insertAuditLog } from "../audit.js";
 import { asyncHandler } from "../async-handler.js";
-import { upsertWorkTypeByName } from "./directories.js";
 
 export const requestsRouter = Router();
 
@@ -294,7 +293,15 @@ requestsRouter.post(
   }),
 );
 
+// Максимальная длина сообщения мастеру при одобрении заявки.
+const MAX_RESPONSE_MESSAGE_LENGTH = 2000;
+
 // Одобрение/отклонение — только curator/admin.
+// Одобрение НЕ создаёт и НЕ изменяет строки work_types: позицию куратор/админ
+// добавляет отдельно ("Добавить в справочник"), а здесь пишет мастеру текст
+// (путь и название внесённой позиции) в message → requests.response_message.
+// Старые клиенты могут по-прежнему присылать resolved_name/resolved_unit/
+// resolved_price — они игнорируются (ни в work_types, ни в заявку не пишутся).
 requestsRouter.put(
   "/:id",
   requireRole("curator", "admin"),
@@ -302,29 +309,41 @@ requestsRouter.put(
     const before = await loadFullRequest(req.params.id);
     if (!before) return res.status(404).json({ error: "not found" });
 
-    const { status, resolved_name, resolved_unit, resolved_price, reject_reason } = req.body || {};
-    if (resolved_price != null && (!Number.isFinite(Number(resolved_price)) || Number(resolved_price) < 0)) {
-      return res.status(400).json({ error: "resolved_price must be a non-negative number" });
+    const { status, reject_reason, message } = req.body || {};
+
+    // message относится только к одобрению; отсутствие поля (или null) —
+    // не трогать сохранённое сообщение, пустая строка после trim — очистить.
+    let responseMessage;
+    if (status === "approved" && message != null) {
+      if (typeof message !== "string") {
+        return res.status(400).json({ error: "message must be a string" });
+      }
+      const trimmed = message.trim();
+      if (trimmed.length > MAX_RESPONSE_MESSAGE_LENGTH) {
+        return res
+          .status(400)
+          .json({ error: `message must be at most ${MAX_RESPONSE_MESSAGE_LENGTH} characters` });
+      }
+      responseMessage = trimmed || null;
     }
+    const setResponseMessage = responseMessage !== undefined;
+
     const { rows } = await pool.query(
       `UPDATE requests SET
          status = COALESCE($1, status),
-         resolved_name = COALESCE($2, resolved_name),
-         resolved_unit = COALESCE($3, resolved_unit),
-         resolved_price = COALESCE($4, resolved_price),
-         reject_reason = COALESCE($5, reject_reason),
+         reject_reason = COALESCE($2, reject_reason),
+         response_message = CASE WHEN $4::boolean THEN $5 ELSE response_message END,
          resolved_at = CASE WHEN $1 = 'approved' THEN now() ELSE resolved_at END,
          rejected_at = CASE WHEN $1 = 'rejected' THEN now() ELSE rejected_at END,
-         resolved_by = CASE WHEN $1 = 'approved' THEN $7 ELSE resolved_by END,
-         rejected_by = CASE WHEN $1 = 'rejected' THEN $7 ELSE rejected_by END
-       WHERE id = $6 RETURNING *`,
+         resolved_by = CASE WHEN $1 = 'approved' THEN $6 ELSE resolved_by END,
+         rejected_by = CASE WHEN $1 = 'rejected' THEN $6 ELSE rejected_by END
+       WHERE id = $3 RETURNING *`,
       [
         status,
-        resolved_name,
-        resolved_unit,
-        resolved_price,
         reject_reason,
         req.params.id,
+        setResponseMessage,
+        responseMessage ?? null,
         req.user.full_name,
       ],
     );
@@ -349,20 +368,6 @@ requestsRouter.put(
       );
     }
 
-    // Одобренная заявка автоматически добавляется в справочник видов работ —
-    // upsertWorkTypeByName сам решит, обновить существующий по имени или
-    // создать новый (и сам же напишет в audit_log с каскадным пересчётом,
-    // если обновляет — см. directories.js).
-    if (status === "approved" && resolved_name && resolved_unit && resolved_price != null) {
-      await upsertWorkTypeByName({
-        name: resolved_name,
-        unit: resolved_unit,
-        price: resolved_price,
-        actorUserId: req.user.id,
-        actorName: req.user.full_name,
-      });
-    }
-
     await insertAuditLog(pool, {
       entityType: "request",
       entityId: Number(req.params.id),
@@ -379,7 +384,7 @@ requestsRouter.put(
     if (authorId && (status === "approved" || status === "rejected")) {
       void sendPushToUser(authorId, {
         title: status === "approved" ? "Заявка одобрена" : "Заявка отклонена",
-        body: rows[0].text,
+        body: status === "approved" && rows[0].response_message ? rows[0].response_message : rows[0].text,
         url: `/messages?request=${rows[0].id}`,
       });
     }

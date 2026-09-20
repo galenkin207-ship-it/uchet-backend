@@ -442,8 +442,7 @@ export const unitsRouter = makeDirectoryRouter({
 
 // cascadeWorkTypeUpdate/validatePrice — вынесены в work-types-shared.js,
 // т.к. нужны также work-types-tree.js (каскадное редактирование дерева).
-// Использование ниже (afterUpdate, validate, upsertWorkTypeByName) не
-// изменилось.
+// Использование ниже (afterUpdate, validate) не изменилось.
 
 export const workTypesRouter = makeDirectoryRouter({
   table: "work_types",
@@ -584,74 +583,3 @@ workTypesRouter.patch(
     res.json(rows[0]);
   }),
 );
-
-// Одобрение заявки раньше всегда безусловно вставляло новую строку в
-// work_types, даже если вид работы с таким названием уже существовал —
-// из-за этого в справочнике накапливались дубли с одинаковым названием и
-// разными ценами (обнаружено на практике: два одноимённых вида работы с
-// разными ценами на staging). Теперь сначала ищем существующий по имени
-// (без учёта регистра/пробелов, как и везде в справочниках) и обновляем
-// его — с тем же каскадом и той же audit-записью, что и ручное редактирование
-// через справочник — вместо создания дубля.
-export async function upsertWorkTypeByName({ name, unit, price, actorUserId, actorName }) {
-  const trimmedName = String(name).trim();
-  const { rows: existingRows } = await pool.query(
-    `SELECT id, name, unit, price, status FROM work_types WHERE lower(btrim(name)) = lower(btrim($1))`,
-    [trimmedName],
-  );
-
-  if (existingRows[0]) {
-    const before = existingRows[0];
-    // Заявку могли одобрить с названием ранее заархивированного вида
-    // работы — он должен снова стать видимым и активным, а не остаться
-    // скрытым архивным с новыми записями на него.
-    const wasArchived = before.status === "archived";
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      const { rows } = await client.query(
-        wasArchived
-          ? `UPDATE work_types SET unit = $1, price = $2, status = 'active', archived_at = NULL WHERE id = $3 RETURNING id, name, unit, price`
-          : `UPDATE work_types SET unit = $1, price = $2 WHERE id = $3 RETURNING id, name, unit, price`,
-        [unit, price, before.id],
-      );
-      await cascadeWorkTypeUpdate(client, rows[0]);
-      await insertAuditLog(client, {
-        entityType: "work_type",
-        entityId: rows[0].id,
-        action: "update",
-        actorUserId,
-        actorName,
-        before,
-        after: rows[0],
-      });
-      await client.query("COMMIT");
-      return rows[0];
-    } catch (err) {
-      await client.query("ROLLBACK");
-      throw err;
-    } finally {
-      client.release();
-    }
-  }
-
-  // sbornik_id (миграция 025) намеренно не проставляется: эта строка не
-  // parent_id-привязана ни к какому дереву (parent_id остаётся NULL,
-  // level — дефолтный 5) и gesn_code у неё никогда не бывает — вне уникального
-  // индекса (sbornik_id, gesn_code) WHERE gesn_code IS NOT NULL, сборника
-  // резолвить не из чего.
-  const { rows } = await pool.query(
-    `INSERT INTO work_types (name, unit, price) VALUES ($1,$2,$3) RETURNING id, name, unit, price`,
-    [trimmedName, unit, price],
-  );
-  await insertAuditLog(pool, {
-    entityType: "work_type",
-    entityId: rows[0].id,
-    action: "create",
-    actorUserId,
-    actorName,
-    before: null,
-    after: rows[0],
-  });
-  return rows[0];
-}

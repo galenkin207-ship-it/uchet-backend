@@ -451,6 +451,58 @@ workTypesTreeRouter.get(
   }),
 );
 
+// GET /:id/path — путь позиции в справочнике (для текстового сообщения мастеру
+// при одобрении заявки): предки от сборника (level 1) вниз до непосредственного
+// родителя + сама позиция. Синтетический корень source='legacy_root' в путь не
+// входит; пропущенные уровни (у пользовательских позиций их может не быть)
+// просто отсутствуют. Цену не отдаём. catalog_type — у level-1 предка; если
+// его нет (позиция под legacy_root), берём catalog_type самой позиции.
+// UNION (а не UNION ALL) — страховка от зацикленного parent_id.
+workTypesTreeRouter.get(
+  "/:id/path",
+  requireRole("admin", "curator"),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: "id должен быть целым числом" });
+    }
+    const { rows: leafRows } = await pool.query(
+      `SELECT id, name, catalog_type FROM work_types WHERE id = $1`,
+      [id],
+    );
+    const leaf = leafRows[0];
+    if (!leaf) return res.status(404).json({ error: "not found" });
+
+    const { rows: ancestors } = await pool.query(
+      `WITH RECURSIVE anc AS (
+         SELECT id, parent_id, level, name, gesn_code, catalog_type, source
+           FROM work_types
+          WHERE id = (SELECT parent_id FROM work_types WHERE id = $1)
+         UNION
+         SELECT wt.id, wt.parent_id, wt.level, wt.name, wt.gesn_code, wt.catalog_type, wt.source
+           FROM work_types wt
+           JOIN anc ON wt.id = anc.parent_id
+       )
+       SELECT id, level, name, gesn_code, catalog_type FROM anc
+        WHERE source IS DISTINCT FROM 'legacy_root'
+        ORDER BY level ASC`,
+      [id],
+    );
+
+    const sbornik = ancestors.find((a) => a.level === 1);
+    res.json({
+      catalog_type: sbornik?.catalog_type ?? leaf.catalog_type ?? null,
+      levels: ancestors.map(({ id: nodeId, level, name, gesn_code }) => ({
+        id: nodeId,
+        level,
+        name,
+        gesn_code,
+      })),
+      leaf: { id: leaf.id, name: leaf.name },
+    });
+  }),
+);
+
 // name и variant_label здесь нет: их считает сам обработчик (см. nameFields в
 // PATCH /:id/edit) по типу родителя.
 const LEAF_EDITABLE_FIELDS = [
