@@ -40,7 +40,10 @@ export async function cascadeWorkTypeUpdate(client, updated) {
 // level 1 (parentId === null), у которых общий NULL parent_id на все каталоги
 // сразу, дополнительно скопировано по catalogType, иначе "Раздел А" в каталоге
 // ГЭСН конфликтовал бы с "Раздел А" в другом каталоге.
-export async function checkNameUniqueAmongSiblings(executor, { parentId, catalogType, name, excludeId }) {
+//
+// activeOnly — считать конфликтом только неархивных братьев (batch-создание);
+// по умолчанию архивные тоже учитываются, как раньше.
+export async function checkNameUniqueAmongSiblings(executor, { parentId, catalogType, name, excludeId, activeOnly = false }) {
   if (!name || !String(name).trim()) return null;
   const clauses = ["lower(btrim(name)) = lower(btrim($1))"];
   const params = [name];
@@ -56,6 +59,7 @@ export async function checkNameUniqueAmongSiblings(executor, { parentId, catalog
     params.push(excludeId);
     clauses.push(`id <> $${params.length}`);
   }
+  if (activeOnly) clauses.push("status <> 'archived'");
   const { rows } = await executor.query(
     `SELECT id FROM work_types WHERE ${clauses.join(" AND ")}`,
     params,
@@ -120,6 +124,38 @@ export function respondWorkTypeDbError(err, res, opts) {
 // строки к сообщению.
 // ---------------------------------------------------------------------------
 
+// Название листа под группой (level 4): группа + вариант в конвенции каталога.
+//   - группа уже оканчивается на ":" (ГЭСН: «Трансформатор трехфазный:») →
+//     «группа вариант»; иначе (пользовательский прайс) → «группа: вариант»;
+//   - пустой вариант → просто название группы;
+//   - защита от задвоения: вариант, который (после нормализации: регистр, ё→е,
+//     без пунктуации и лишних пробелов) равен названию группы или начинается с
+//     него по границе слова, уже содержит группу — берётся как есть.
+// Лишние пробелы в группе и варианте схлопываются. Единственное место, где
+// сервер собирает имя листа под группой (batch и PATCH /:id/edit).
+function normalizeForNameCompare(text) {
+  return text
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function buildLeafName(groupName, variant) {
+  const group = String(groupName ?? "").replace(/\s+/g, " ").trim();
+  const v = String(variant ?? "").replace(/\s+/g, " ").trim();
+  if (!v) return group;
+  if (!group) return v;
+
+  const normGroup = normalizeForNameCompare(group);
+  const normVariant = normalizeForNameCompare(v);
+  if (normGroup && (normVariant === normGroup || normVariant.startsWith(`${normGroup} `))) {
+    return v;
+  }
+  return group.endsWith(":") ? `${group} ${v}` : `${group}: ${v}`;
+}
+
 // Обязательные поля листа: название, единица (NOT NULL в work_types — без неё
 // INSERT упал бы с 23502) и цена. Возвращает текст ошибки или null.
 export function validateLeafInput({ name, unit, price }) {
@@ -133,7 +169,7 @@ export function validateLeafInput({ name, unit, price }) {
 // не проскочили между проверкой уникальности и вставкой).
 export async function loadLeafParent(executor, parentId, { forUpdate = false } = {}) {
   const { rows } = await executor.query(
-    `SELECT id, level, status, sbornik_id, catalog_type FROM work_types WHERE id = $1${forUpdate ? " FOR UPDATE" : ""}`,
+    `SELECT id, level, name, status, sbornik_id, catalog_type FROM work_types WHERE id = $1${forUpdate ? " FOR UPDATE" : ""}`,
     [parentId],
   );
   const parent = rows[0];
@@ -146,7 +182,11 @@ export async function loadLeafParent(executor, parentId, { forUpdate = false } =
 // Уникальность имени среди братьев и gesn_code в сборнике, затем INSERT листа
 // (level=5, source='manual', status='active'). fields.name/variant_label уже
 // финальные (name — итоговое имя листа). Возвращает { id } или { error }.
-export async function insertLeaf(executor, parent, fields) {
+// options.nameConflictMessage — если задан, проверка имени идёт только среди
+// неархивных братьев и при конфликте (в т.ч. на уровне БД) отдаётся этот текст
+// (batch); без options поведение прежнее (одиночный POST).
+export async function insertLeaf(executor, parent, fields, options = {}) {
+  const { nameConflictMessage = null } = options;
   const { name, variant_label, unit, price, has_price, labor_hours, gesn_code, work_composition, sort_order } = fields;
 
   const nameError = await checkNameUniqueAmongSiblings(executor, {
@@ -154,8 +194,9 @@ export async function insertLeaf(executor, parent, fields) {
     catalogType: parent.catalog_type,
     name,
     excludeId: null,
+    activeOnly: nameConflictMessage != null,
   });
-  if (nameError) return { error: { status: 409, error: nameError } };
+  if (nameError) return { error: { status: 409, error: nameConflictMessage ?? nameError } };
 
   const sbornikId = parent.level === 1 ? parent.id : parent.sbornik_id;
   const trimmedGesnCode = gesn_code != null && String(gesn_code).trim() ? String(gesn_code).trim() : null;
@@ -192,7 +233,7 @@ export async function insertLeaf(executor, parent, fields) {
     if (err.code === "23505" && err.constraint === "idx_work_types_sbornik_gesn_code") {
       return { error: { status: 409, error: `Код ГЭСН «${trimmedGesnCode}» уже используется в этом сборнике` } };
     }
-    const mapped = mapWorkTypeDbError(err, { duplicateMessage: "Такая позиция уже есть" });
+    const mapped = mapWorkTypeDbError(err, { duplicateMessage: nameConflictMessage ?? "Такая позиция уже есть" });
     if (mapped) return { error: mapped };
     throw err;
   }

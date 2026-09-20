@@ -14,6 +14,7 @@ import {
   validateLeafInput,
   loadLeafParent,
   insertLeaf,
+  buildLeafName,
 } from "./work-types-shared.js";
 
 // Роутер поверх древовидной структуры work_types (level, parent_id,
@@ -403,9 +404,9 @@ workTypesTreeRouter.get(
   }),
 );
 
+// name и variant_label здесь нет: их считает сам обработчик (см. nameFields в
+// PATCH /:id/edit) по типу родителя.
 const LEAF_EDITABLE_FIELDS = [
-  "name",
-  "variant_label",
   "unit",
   "price",
   "has_price",
@@ -418,7 +419,8 @@ const LEAF_EDITABLE_FIELDS = [
 // PATCH /:id/edit — изменение листа (level=5): поля из LEAF_EDITABLE_FIELDS
 // плюс необязательная смена родителя (parent_id). level листа не меняется
 // никогда (лист всегда level=5) — при смене parent_id пересчитывается только
-// sbornik_id по новому родителю. Транзакция: строка блокируется FOR UPDATE,
+// sbornik_id по новому родителю. name/variant_label считаются по типу родителя
+// (группа level 4 → buildLeafName, только при смене варианта/родителя). Транзакция: строка блокируется FOR UPDATE,
 // после UPDATE — тот же каскад в record_items/records, что и у обычного
 // справочника (cascadeWorkTypeUpdate), и audit_log — всё атомарно.
 workTypesTreeRouter.patch(
@@ -456,10 +458,6 @@ workTypesTreeRouter.patch(
           return res.status(400).json({ error: priceError });
         }
       }
-      if ("name" in body && (!body.name || !String(body.name).trim())) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({ error: "Укажите название" });
-      }
       // unit/price/has_price/sort_order — NOT NULL: явный null в теле иначе
       // дошёл бы до UPDATE и упал бы с 23502 (validatePrice(null) пропускает).
       if ("unit" in body && (body.unit == null || !String(body.unit).trim())) {
@@ -476,6 +474,7 @@ workTypesTreeRouter.patch(
       let newParentId = current.parent_id;
       let newSbornikId = current.sbornik_id;
       let newCatalogType = current.catalog_type;
+      let newParentRow = null;
       const parentChanged = "parent_id" in body && Number(body.parent_id) !== current.parent_id;
 
       if (parentChanged) {
@@ -485,7 +484,7 @@ workTypesTreeRouter.patch(
           return res.status(400).json({ error: "parent_id должен быть целым числом" });
         }
         const { rows: parentRows } = await client.query(
-          `SELECT id, level, status, sbornik_id, catalog_type FROM work_types WHERE id = $1`,
+          `SELECT id, level, name, status, sbornik_id, catalog_type FROM work_types WHERE id = $1`,
           [parentId],
         );
         const parent = parentRows[0];
@@ -504,18 +503,52 @@ workTypesTreeRouter.patch(
         newParentId = parent.id;
         newSbornikId = parent.level === 1 ? parent.id : parent.sbornik_id;
         newCatalogType = parent.catalog_type;
+        newParentRow = parent;
+      } else if (current.parent_id != null) {
+        const { rows: parentRows } = await client.query(
+          `SELECT id, level, name FROM work_types WHERE id = $1`,
+          [current.parent_id],
+        );
+        newParentRow = parentRows[0] ?? null;
       }
 
-      const finalName = "name" in body ? body.name : current.name;
-      const nameError = await checkNameUniqueAmongSiblings(client, {
-        parentId: newParentId,
-        catalogType: newCatalogType,
-        name: finalName,
-        excludeId: id,
-      });
-      if (nameError) {
+      // Имя и вариант. Родитель — группа (level 4): name пересчитывается через
+      // buildLeafName ТОЛЬКО если изменился variant_label или сменился родитель
+      // при непустом варианте; иначе name не трогаем (у старых позиций имя могло
+      // быть другим), переданный name игнорируется. Родитель не группа: переданный
+      // name — итоговое имя, variant_label = NULL.
+      const normalizeVariant = (v) => (v != null && String(v).trim() ? String(v).trim() : null);
+      const nameFields = {};
+      if (newParentRow?.level === 4) {
+        const currentVariant = normalizeVariant(current.variant_label);
+        const variantInBody = "variant_label" in body;
+        const nextVariant = variantInBody ? normalizeVariant(body.variant_label) : currentVariant;
+        const variantChanged = variantInBody && nextVariant !== currentVariant;
+        if (variantChanged) nameFields.variant_label = nextVariant;
+        if (variantChanged || (parentChanged && nextVariant)) {
+          nameFields.name = buildLeafName(newParentRow.name, nextVariant);
+        }
+      } else if ("name" in body) {
+        nameFields.name = body.name != null ? String(body.name).trim() : "";
+        nameFields.variant_label = null;
+      }
+      if ("name" in nameFields && !nameFields.name) {
         await client.query("ROLLBACK");
-        return res.status(409).json({ error: nameError });
+        return res.status(400).json({ error: "Укажите название" });
+      }
+
+      // Уникальность имени — только если имя изменилось или лист переехал.
+      if ("name" in nameFields || parentChanged) {
+        const nameError = await checkNameUniqueAmongSiblings(client, {
+          parentId: newParentId,
+          catalogType: newCatalogType,
+          name: nameFields.name ?? current.name,
+          excludeId: id,
+        });
+        if (nameError) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({ error: nameError });
+        }
       }
 
       const finalGesnCode = "gesn_code" in body
@@ -532,11 +565,15 @@ workTypesTreeRouter.patch(
       const setParts = [];
       const values = [];
       let idx = 1;
+      for (const [field, value] of Object.entries(nameFields)) {
+        setParts.push(`${field} = $${idx}`);
+        values.push(value);
+        idx += 1;
+      }
       for (const field of LEAF_EDITABLE_FIELDS) {
         if (!(field in body)) continue;
         setParts.push(`${field} = $${idx}`);
-        if (field === "name") values.push(String(body.name).trim());
-        else if (field === "gesn_code") values.push(finalGesnCode);
+        if (field === "gesn_code") values.push(finalGesnCode);
         else values.push(body[field]);
         idx += 1;
       }
@@ -550,6 +587,12 @@ workTypesTreeRouter.patch(
       }
       if (!setParts.length) {
         await client.query("ROLLBACK");
+        // Известные поля переданы, но ничего не меняют (напр. name у листа под
+        // группой при том же варианте) — не ошибка, отдаём лист как есть.
+        const knownKeys = ["name", "variant_label", "parent_id", ...LEAF_EDITABLE_FIELDS];
+        if (knownKeys.some((k) => k in body)) {
+          return res.json(await buildLeafDetail(pool, id));
+        }
         return res.status(400).json({ error: "Нет полей для изменения" });
       }
       values.push(id);
@@ -710,33 +753,40 @@ workTypesTreeRouter.post(
   }),
 );
 
-// POST /batch — создание нескольких листьев (вариантов одной позиции) под
-// одним контейнером любого уровня 1-4 за один запрос: общее название (name) +
-// варианты. Итоговое имя листа = name + (variant_label ? " " + variant_label : "");
-// variant_label сохраняется отдельно. Валидации и вставка — тот же хелпер, что
-// у одиночного POST /api/work-types (insertLeaf), ошибки дополняются номером
-// строки («Строка N: ...»). Всё в одной транзакции: любая ошибка — ROLLBACK,
-// ничего не создаётся. Дубли внутри самого запроса ловятся теми же проверками
-// уникальности (они видят уже вставленные строки этой транзакции). Родитель
-// блокируется FOR UPDATE — параллельный запрос не проскочит между проверкой и
-// вставкой. Права как у одиночного создания листа: admin и curator.
+// POST /batch — создание нескольких листьев под одним контейнером (level 1-4)
+// за один запрос. Тело: { parent_id, work_composition?, items: [{ text, unit,
+// price, has_price, labor_hours, gesn_code }] }, 1-50 строк. Название листа
+// считает СЕРВЕР:
+//   - родитель — группа (level 4): text = вариант, name = buildLeafName(группа,
+//     вариант), variant_label = вариант или NULL; при нескольких строках вариант
+//     обязателен в каждой (одна строка без варианта → name = название группы);
+//   - родитель — контейнер level < 4: text = полное название, обязателен,
+//     variant_label = NULL.
+// Ошибки — с номером строки («Строка N: ...»). Уникальность имени — среди
+// неархивных братьев (409 «Такая позиция уже есть в этом месте»), gesn_code — как
+// у одиночного создания. Всё в одной транзакции: любая ошибка — ROLLBACK, ничего
+// не создаётся. Дубли внутри самого запроса ловятся теми же проверками (они
+// видят строки, уже вставленные этой транзакцией). Родитель блокируется FOR
+// UPDATE — параллельный запрос не проскочит между проверкой и вставкой. Права
+// как у одиночного создания листа: admin и curator.
+const BATCH_MAX_ITEMS = 50;
+
 workTypesTreeRouter.post(
   "/batch",
   requireRole("admin", "curator"),
   asyncHandler(async (req, res) => {
-    const { parent_id, name, work_composition, variants } = req.body || {};
+    const { parent_id, work_composition, items } = req.body || {};
 
     const parentId = Number(parent_id);
     if (parent_id == null || parent_id === "" || !Number.isInteger(parentId)) {
       return res.status(400).json({ error: "parent_id обязателен и должен быть целым числом" });
     }
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ error: "Укажите название" });
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Добавьте хотя бы одну позицию" });
     }
-    if (!Array.isArray(variants) || variants.length === 0) {
-      return res.status(400).json({ error: "Укажите хотя бы один вариант" });
+    if (items.length > BATCH_MAX_ITEMS) {
+      return res.status(400).json({ error: `Не больше ${BATCH_MAX_ITEMS} позиций за один раз` });
     }
-    const baseName = String(name).trim();
 
     const client = await pool.connect();
     try {
@@ -747,41 +797,55 @@ workTypesTreeRouter.post(
         await client.query("ROLLBACK");
         return res.status(parentError.status).json({ error: parentError.error });
       }
+      const isGroup = parent.level === 4;
 
       const createdIds = [];
-      for (let i = 0; i < variants.length; i += 1) {
+      for (let i = 0; i < items.length; i += 1) {
         const rowLabel = `Строка ${i + 1}`;
-        const variant = variants[i];
-        if (variant == null || typeof variant !== "object" || Array.isArray(variant)) {
+        const item = items[i];
+        const rowError = async (status, message) => {
           await client.query("ROLLBACK");
-          return res.status(400).json({ error: `${rowLabel}: некорректный вариант` });
-        }
-        const { variant_label, unit, price, has_price, labor_hours, gesn_code, sort_order } = variant;
+          return res.status(status).json({ error: `${rowLabel}: ${message}` });
+        };
 
-        const label = variant_label != null && String(variant_label).trim() ? String(variant_label).trim() : null;
-        const leafName = label ? `${baseName} ${label}` : baseName;
-
-        const inputError = validateLeafInput({ name: leafName, unit, price });
-        if (inputError) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({ error: `${rowLabel}: ${inputError}` });
+        if (item == null || typeof item !== "object" || Array.isArray(item)) {
+          return rowError(400, "некорректная позиция");
         }
+        const { text, unit, price, has_price, labor_hours, gesn_code } = item;
 
-        const { id, error } = await insertLeaf(client, parent, {
-          name: leafName,
-          variant_label: label,
-          unit,
-          price,
-          has_price,
-          labor_hours,
-          gesn_code,
-          work_composition,
-          sort_order,
-        });
-        if (error) {
-          await client.query("ROLLBACK");
-          return res.status(error.status).json({ error: `${rowLabel}: ${error.error}` });
+        if (unit == null || !String(unit).trim()) return rowError(400, "Укажите единицу измерения");
+        const priceError = validatePrice(price);
+        if (priceError) return rowError(400, priceError);
+
+        const trimmedText = text != null ? String(text).trim() : "";
+        let leafName;
+        let variantLabel = null;
+        if (isGroup) {
+          if (!trimmedText && items.length > 1) return rowError(400, "Укажите вариант");
+          variantLabel = trimmedText || null;
+          leafName = buildLeafName(parent.name, variantLabel);
+        } else {
+          if (!trimmedText) return rowError(400, "Введите название позиции");
+          leafName = trimmedText;
         }
+        if (!leafName) return rowError(400, "Введите название позиции");
+
+        const { id, error } = await insertLeaf(
+          client,
+          parent,
+          {
+            name: leafName,
+            variant_label: variantLabel,
+            unit,
+            price,
+            has_price,
+            labor_hours,
+            gesn_code,
+            work_composition,
+          },
+          { nameConflictMessage: "Такая позиция уже есть в этом месте" },
+        );
+        if (error) return rowError(error.status, error.error);
         createdIds.push(id);
 
         const detail = await buildLeafDetail(client, id);
@@ -803,12 +867,12 @@ workTypesTreeRouter.post(
         `SELECT ${TREE_COLUMNS} FROM work_types WHERE id = ANY($1) ORDER BY id`,
         [createdIds],
       );
-      const items = rows.map((r) =>
+      const created = rows.map((r) =>
         annotateTreeItem({ ...r, has_children: false, has_counter_steps: false }, req.user),
       );
 
       await client.query("COMMIT");
-      res.status(201).json({ items });
+      res.status(201).json({ items: created });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       throw err;
