@@ -509,6 +509,29 @@ workTypesTreeRouter.get(
   }),
 );
 
+// Предки узла от сборника (level 1) вниз до непосредственного родителя, без
+// самого узла и без синтетического корня source='legacy_root'; пропущенные
+// уровни просто отсутствуют. UNION (а не UNION ALL) — страховка от зацикленного
+// parent_id. Общая для GET /:id/path и GET /:id/details.
+async function loadAncestorChain(id) {
+  const { rows } = await pool.query(
+    `WITH RECURSIVE anc AS (
+       SELECT id, parent_id, level, name, gesn_code, catalog_type, source
+         FROM work_types
+        WHERE id = (SELECT parent_id FROM work_types WHERE id = $1)
+       UNION
+       SELECT wt.id, wt.parent_id, wt.level, wt.name, wt.gesn_code, wt.catalog_type, wt.source
+         FROM work_types wt
+         JOIN anc ON wt.id = anc.parent_id
+     )
+     SELECT id, level, name, gesn_code, catalog_type FROM anc
+      WHERE source IS DISTINCT FROM 'legacy_root'
+      ORDER BY level ASC`,
+    [id],
+  );
+  return rows;
+}
+
 // GET /:id/path — путь позиции в справочнике (для текстового сообщения мастеру
 // при одобрении заявки): предки от сборника (level 1) вниз до непосредственного
 // родителя + сама позиция. Синтетический корень source='legacy_root' в путь не
@@ -531,21 +554,7 @@ workTypesTreeRouter.get(
     const leaf = leafRows[0];
     if (!leaf) return res.status(404).json({ error: "not found" });
 
-    const { rows: ancestors } = await pool.query(
-      `WITH RECURSIVE anc AS (
-         SELECT id, parent_id, level, name, gesn_code, catalog_type, source
-           FROM work_types
-          WHERE id = (SELECT parent_id FROM work_types WHERE id = $1)
-         UNION
-         SELECT wt.id, wt.parent_id, wt.level, wt.name, wt.gesn_code, wt.catalog_type, wt.source
-           FROM work_types wt
-           JOIN anc ON wt.id = anc.parent_id
-       )
-       SELECT id, level, name, gesn_code, catalog_type FROM anc
-        WHERE source IS DISTINCT FROM 'legacy_root'
-        ORDER BY level ASC`,
-      [id],
-    );
+    const ancestors = await loadAncestorChain(id);
 
     const sbornik = ancestors.find((a) => a.level === 1);
     res.json({
@@ -557,6 +566,40 @@ workTypesTreeRouter.get(
         gesn_code,
       })),
       leaf: { id: leaf.id, name: leaf.name },
+    });
+  }),
+);
+
+// GET /:id/details — «Сведения о позиции» для модалки справочника (admin/curator,
+// как и /:id/path). Поля позиции как есть (work_composition — строка/null, пустое
+// не выдумываем) + path: цепочка предков от сборника до непосредственного
+// родителя БЕЗ самой позиции (та же цепочка, что в /:id/path).
+workTypesTreeRouter.get(
+  "/:id/details",
+  requireRole("admin", "curator"),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: "id должен быть целым числом" });
+    }
+    const { rows } = await pool.query(
+      `SELECT id, name, variant_label, gesn_code, source, catalog_type,
+              unit, price, has_price, labor_hours, work_composition
+         FROM work_types WHERE id = $1`,
+      [id],
+    );
+    const item = rows[0];
+    if (!item) return res.status(404).json({ error: "not found" });
+
+    const ancestors = await loadAncestorChain(id);
+    res.json({
+      ...item,
+      path: ancestors.map(({ id: nodeId, level, name, gesn_code }) => ({
+        id: nodeId,
+        level,
+        name,
+        gesn_code,
+      })),
     });
   }),
 );
