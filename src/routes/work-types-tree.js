@@ -573,7 +573,8 @@ workTypesTreeRouter.get(
 // GET /:id/details — «Сведения о позиции» для модалки справочника (admin/curator,
 // как и /:id/path). Поля позиции как есть (work_composition — строка/null, пустое
 // не выдумываем) + path: цепочка предков от сборника до непосредственного
-// родителя БЕЗ самой позиции (та же цепочка, что в /:id/path).
+// родителя БЕЗ самой позиции (та же цепочка, что в /:id/path). catalog_type —
+// позиции, а если он null, то сборника (предок level=1).
 workTypesTreeRouter.get(
   "/:id/details",
   requireRole("admin", "curator"),
@@ -592,8 +593,11 @@ workTypesTreeRouter.get(
     if (!item) return res.status(404).json({ error: "not found" });
 
     const ancestors = await loadAncestorChain(id);
+    // Если у самой позиции catalog_type не задан — берём его у сборника (level 1).
+    const sbornik = ancestors.find((a) => a.level === 1);
     res.json({
       ...item,
+      catalog_type: item.catalog_type ?? sbornik?.catalog_type ?? null,
       path: ancestors.map(({ id: nodeId, level, name, gesn_code }) => ({
         id: nodeId,
         level,
