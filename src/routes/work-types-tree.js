@@ -357,26 +357,77 @@ function matchScore(text, tokens) {
   return score;
 }
 
+// Токен, похожий на код ГЭСН: "08-06", "08-06-001", "08-06-001-01" (допускаем
+// частичный ввод — поиск по префиксу gesn_code).
+const GESN_CODE_TOKEN_RE = /^\d{2}(-\d{1,3}){1,3}$/;
+
+// Разбор запроса для /search. Длинные тире → "-", пробелы вокруг дефиса между
+// цифрами убираются ("08 - 06 - 001" → "08-06-001"). Если в запросе нашёлся
+// токен-код — используем нормализованные токены и отдаём codeToken; иначе
+// токенизация прежняя (tokenize), чтобы чисто текстовый поиск не менялся.
+function parseSearchQuery(rawQuery) {
+  const codeNormalized = normalize(rawQuery)
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/(?<=\d)\s*-\s*(?=\d)/g, "-");
+  const codeTokens = codeNormalized.split(/\s+/).filter(Boolean);
+  const codeToken = codeTokens.find((t) => GESN_CODE_TOKEN_RE.test(t)) ?? null;
+  if (codeToken) return { tokens: codeTokens, codeToken };
+  return { tokens: tokenize(rawQuery), codeToken: null };
+}
+
+// Бонус к score точного совпадения gesn_code в режиме "код + слова" (score:
+// чем меньше — тем выше в выдаче; типичный score текста — десятки-сотни).
+const EXACT_CODE_SCORE_BONUS = 10000;
+
 // GET /search?q=<строка>&limit=<число, по умолчанию 50, максимум 200>
 // Двухэтапно: SQL сужает кандидатов до level=5 позиций, содержащих все
 // токены (верхняя защитная граница LIMIT 500, не финальная выдача), затем
 // JS считает тот же score, что и в клиентском smart-search, и сортирует.
+//
+// Поиск по коду ГЭСН: токен-код (см. GESN_CODE_TOKEN_RE) матчится либо по
+// префиксу gesn_code, либо по тексту name (OR внутри токена, AND между
+// токенами). Чтобы LIMIT 500 не отрезал совпадения по коду, SQL сортирует
+// code_tier (0 — точное, 1 — префикс, 2 — только текст) перед LIMIT.
+//  - Запрос из одного кода: выдача = точные → префиксные (по gesn_code) →
+//    текстовые (по score).
+//  - Код + слова: единая сортировка по score, у точного совпадения кода бонус.
+// Один код может быть в нескольких сборниках — возвращаем все листья.
 workTypesTreeRouter.get(
   "/search",
   requireAuth,
   asyncHandler(async (req, res) => {
     const rawQuery = req.query.q;
-    const tokens = tokenize(rawQuery);
+    const { tokens, codeToken } = parseSearchQuery(rawQuery);
     if (!rawQuery || normalize(rawQuery).length < 2 || tokens.length === 0) {
       return res.json({ items: [] });
     }
+    const codeOnly = codeToken != null && tokens.length === 1;
 
     let limit = Number(req.query.limit);
     if (!Number.isFinite(limit) || limit <= 0) limit = 50;
     limit = Math.min(Math.trunc(limit), 200);
 
-    const ilikeClauses = tokens.map((_, i) => `wt.name ILIKE $${i + 1}`).join(" AND ");
     const params = tokens.map((t) => `%${t}%`);
+    let codeTierSelect = "2 AS code_tier";
+    let orderBy = "wt.id";
+    let codeClauseFor = null;
+    if (codeToken) {
+      params.push(codeToken, `${codeToken}%`);
+      const exactParam = `$${params.length - 1}`;
+      const prefixParam = `$${params.length}`;
+      codeTierSelect = `CASE WHEN wt.gesn_code ILIKE ${exactParam} THEN 0
+                             WHEN wt.gesn_code ILIKE ${prefixParam} THEN 1
+                             ELSE 2 END AS code_tier`;
+      orderBy = "code_tier, CASE WHEN wt.gesn_code ILIKE " + prefixParam +
+        " THEN wt.gesn_code END, wt.id";
+      codeClauseFor = (i) =>
+        tokens[i] === codeToken
+          ? `(wt.name ILIKE $${i + 1} OR wt.gesn_code ILIKE ${prefixParam})`
+          : null;
+    }
+    const ilikeClauses = tokens
+      .map((_, i) => (codeClauseFor && codeClauseFor(i)) || `wt.name ILIKE $${i + 1}`)
+      .join(" AND ");
 
     // 4 уровня предков фиксированы деревом (сборник → раздел → таблица →
     // группа) — прямые JOIN проще и понятнее, чем рекурсивный CTE, для
@@ -391,18 +442,21 @@ workTypesTreeRouter.get(
                    AND s.status <> 'archived'
               ) AS has_counter_steps,
               p1.name AS breadcrumb_1, p2.name AS breadcrumb_2,
-              p3.name AS breadcrumb_3, p4.name AS breadcrumb_4
+              p3.name AS breadcrumb_3, p4.name AS breadcrumb_4,
+              ${codeTierSelect}
          FROM work_types wt
          LEFT JOIN work_types p4 ON p4.id = wt.parent_id
          LEFT JOIN work_types p3 ON p3.id = p4.parent_id
          LEFT JOIN work_types p2 ON p2.id = p3.parent_id
          LEFT JOIN work_types p1 ON p1.id = p2.parent_id
         WHERE wt.level = 5 AND wt.status <> 'archived' AND wt.is_step_item = false AND ${ilikeClauses}
-        ORDER BY wt.id
+        ORDER BY ${orderBy}
         LIMIT 500`,
       params,
     );
 
+    // Array.prototype.sort стабилен: в режиме "только код" порядок точных и
+    // префиксных совпадений (gesn_code, id) остаётся таким, как отдал SQL.
     const items = rows
       .map((row) => {
         const {
@@ -410,17 +464,21 @@ workTypesTreeRouter.get(
           breadcrumb_2: b2,
           breadcrumb_3: b3,
           breadcrumb_4: b4,
+          code_tier: codeTier,
           ...item
         } = row;
+        let score = matchScore(row.name, tokens);
+        if (!codeOnly && codeTier === 0) score -= EXACT_CODE_SCORE_BONUS;
         return {
           ...item,
           breadcrumb: dedupeBreadcrumb([b1, b2, b3, b4].filter((x) => x != null)),
-          score: matchScore(row.name, tokens),
+          tier: codeOnly ? codeTier : 2,
+          score,
         };
       })
-      .sort((a, b) => a.score - b.score)
+      .sort((a, b) => a.tier - b.tier || (a.tier === 2 ? a.score - b.score : 0))
       .slice(0, limit)
-      .map(({ score, ...item }) => item);
+      .map(({ score, tier, ...item }) => item);
 
     res.json({ items });
   }),
