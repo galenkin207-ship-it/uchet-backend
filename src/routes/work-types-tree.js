@@ -22,8 +22,9 @@ import {
 // тот остаётся плоским CRUD-справочником для админки (простые виды работ без
 // дерева), этот — каскадный выбор вида работы и полнотекстовый поиск по дереву
 // на фронте/мобильном (GET /tree, /search, /:baseId/counter-steps — любой
-// авторизованный), плюс каскадное редактирование самого дерева (GET .../detail,
-// PATCH .../edit, POST/PATCH .../nodes — только admin/curator).
+// авторизованный), плюс каскадное редактирование самого дерева (GET .../detail —
+// admin/curator; PATCH .../edit правки существующей позиции — только admin;
+// остальные POST/PATCH .../nodes — см. requireRole на каждом хендлере).
 export const workTypesTreeRouter = Router();
 
 const TREE_COLUMNS = `
@@ -629,7 +630,7 @@ const LEAF_EDITABLE_FIELDS = [
 // справочника (cascadeWorkTypeUpdate), и audit_log — всё атомарно.
 workTypesTreeRouter.patch(
   "/:id/edit",
-  requireRole("admin", "curator"),
+  requireRole("admin"),
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) {
