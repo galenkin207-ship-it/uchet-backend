@@ -106,24 +106,54 @@ function normalizeForCompare(name) {
 //
 // includeEmpty (только admin, см. GET /tree) — режим редактирования структуры:
 // контейнеры (level<5) без единого настоящего листа в поддереве НЕ скрываются,
-// а отдаются с is_empty=true; has_children считается по любым неархивным
-// не-шаговым детям (листья или контейнеры, в том числе пустые).
+// а отдаются с is_empty=true; has_children считается по любым видимым
+// неархивным не-шаговым детям (листья или контейнеры, в том числе пустые).
+// Исключение — контейнер-модификатор: в поддереве есть шаговые листья, но нет
+// ни одного настоящего (напр. группа «Добавлять или исключать на каждые 5 мм»).
+// Он скрыт и здесь, как в пикере: это не пустая заготовка под новые позиции,
+// а служебная обёртка шаговых строк (ancestors_with_step_leaf).
 // containersOnly — только контейнеры (level<5), для селекторов «Расположение».
 // level — только узлы с этим level (level — тип узла, не глубина: группа
 // level=4 может лежать прямо под сборником).
 async function fetchChildrenRows(where, params, { includeEmpty = false, containersOnly = false, level = null } = {}) {
   const hasChildrenCond = includeEmpty
-    ? `TRUE`
+    ? `(
+                   c.level = 5
+                   OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = c.id)
+                   OR NOT EXISTS (SELECT 1 FROM ancestors_with_step_leaf a WHERE a.id = c.id)
+                 )`
     : `(
                    c.level = 5
                    OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = c.id)
                  )`;
   const visibleCond = includeEmpty
-    ? `TRUE`
+    ? `(
+          wt.level = 5
+          OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = wt.id)
+          OR NOT EXISTS (SELECT 1 FROM ancestors_with_step_leaf a WHERE a.id = wt.id)
+        )`
     : `(
           wt.level = 5
           OR EXISTS (SELECT 1 FROM ancestors_with_real_leaf a WHERE a.id = wt.id)
         )`;
+  // Предки шаговых листьев — нужны только в режиме includeEmpty (см. выше).
+  const stepLeafCte = includeEmpty
+    ? `,
+     step_leaf_ancestors AS (
+       SELECT id AS leaf_id, parent_id AS ancestor_id
+         FROM work_types
+        WHERE level = 5 AND is_step_item = true AND status <> 'archived'
+              AND parent_id IS NOT NULL
+       UNION ALL
+       SELECT sla.leaf_id, wt3.parent_id AS ancestor_id
+         FROM step_leaf_ancestors sla
+         JOIN work_types wt3 ON wt3.id = sla.ancestor_id
+        WHERE wt3.parent_id IS NOT NULL
+     ),
+     ancestors_with_step_leaf AS (
+       SELECT DISTINCT ancestor_id AS id FROM step_leaf_ancestors
+     )`
+    : "";
   // is_empty — только в режиме includeEmpty и только у контейнеров: настоящего
   // (не шагового) листа нет нигде в поддереве.
   const isEmptyCol = includeEmpty
@@ -149,7 +179,7 @@ async function fetchChildrenRows(where, params, { includeEmpty = false, containe
      ),
      ancestors_with_real_leaf AS (
        SELECT DISTINCT ancestor_id AS id FROM leaf_ancestors
-     )
+     )${stepLeafCte}
      SELECT ${TREE_COLUMNS},${isEmptyCol}
             EXISTS (
               SELECT 1 FROM work_types c
