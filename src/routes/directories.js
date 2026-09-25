@@ -12,6 +12,8 @@ import {
   validateLeafInput,
   loadLeafParent,
   insertLeaf,
+  embeddingTextChanged,
+  scheduleEmbeddingRefresh,
 } from "./work-types-shared.js";
 
 // Небольшой генератор CRUD-роутера для простых справочников вида
@@ -37,6 +39,9 @@ function makeDirectoryRouter({
   validate,
   entityType,
   listWhere,
+  // afterResponse(before, after) — необязательный фоновый хук после ответа
+  // на PUT (например, пересчёт эмбеддинга вида работ); не ждём его.
+  afterResponse,
   // work_types нужен свой POST "/" (каскадные поля дерева, роли admin+curator
   // вместо только admin) — при customCreate=true фабрика не регистрирует
   // здесь общий POST, вызывающий код сам вешает его на тот же router.
@@ -167,6 +172,7 @@ function makeDirectoryRouter({
         }
         await client.query("COMMIT");
         res.json(rows[0]);
+        if (afterResponse) afterResponse(beforeRows[0], rows[0]);
       } catch (err) {
         await client.query("ROLLBACK");
         throw err;
@@ -453,6 +459,9 @@ export const workTypesRouter = makeDirectoryRouter({
   listWhere: "status <> 'archived' AND level = 5 AND source IN ('legacy', 'manual')",
   entityType: "work_type",
   afterUpdate: cascadeWorkTypeUpdate,
+  afterResponse: (before, after) => {
+    if (embeddingTextChanged(before, after)) scheduleEmbeddingRefresh(after.id);
+  },
   validate: async (pool, body, excludeId) => {
     const nameError = await checkNameUnique(pool, "work_types", body.name, excludeId, "Вид работы");
     if (nameError) return nameError;
@@ -523,6 +532,7 @@ workTypesRouter.post(
       after: detail,
     });
     res.status(201).json(detail);
+    scheduleEmbeddingRefresh(newId);
   }),
 );
 

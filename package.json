@@ -16,8 +16,12 @@
     "express": "^4.19.2",
     "multer": "^2.0.0",
     "nodemailer": "^6.9.14",
+    "openai": "^6.49.0",
     "pg": "^8.11.5",
     "sharp": "^0.35.0",
     "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "xlsx": "^0.18.5"
   }
 }

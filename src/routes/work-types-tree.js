@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { pool } from "../db.js";
+import { getEmbedding } from "../openai.js";
 import { requireAuth, requireRole, isAdminLike } from "../auth.js";
 import { asyncHandler } from "../async-handler.js";
 import { insertAuditLog } from "../audit.js";
@@ -15,6 +16,8 @@ import {
   loadLeafParent,
   insertLeaf,
   buildLeafName,
+  embeddingTextChanged,
+  scheduleEmbeddingRefresh,
 } from "./work-types-shared.js";
 
 // Роутер поверх древовидной структуры work_types (level, parent_id,
@@ -516,6 +519,64 @@ workTypesTreeRouter.get(
 );
 
 // ---------------------------------------------------------------------------
+// GET /search-smart?q=<строка> — семантический поиск через эмбеддинги (ступень A).
+// Запрос превращается в вектор (OpenAI text-embedding-3-small) и сравнивается
+// с embedding каждой листовой позиции по косинусной близости (оператор <=>,
+// использует HNSW-индекс work_types_embedding_hnsw_idx). Возвращает те же поля,
+// что и обычный /search, плюс similarity вместо score (чем больше — тем ближе).
+workTypesTreeRouter.get(
+  "/search-smart",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const rawQuery = req.query.q;
+    if (!rawQuery || String(rawQuery).trim().length < 2) {
+      return res.json({ items: [] });
+    }
+
+    let limit = Number(req.query.limit);
+    if (!Number.isFinite(limit) || limit <= 0) limit = 20;
+    limit = Math.min(Math.trunc(limit), 50);
+
+    const queryEmbedding = await getEmbedding(String(rawQuery).trim());
+    const vectorLiteral = JSON.stringify(queryEmbedding);
+
+    const { rows } = await pool.query(
+      `SELECT wt.id, wt.name, wt.level, wt.parent_id, wt.unit, wt.price, wt.has_price,
+              wt.gesn_code, wt.catalog_type, wt.is_step_item, wt.step_unit_label,
+              wt.work_composition, wt.labor_hours, wt.source, wt.variant_label,
+              EXISTS (
+                SELECT 1 FROM work_types s
+                WHERE s.step_base_work_type_id = wt.id AND s.is_counter_step = true
+                  AND s.status <> 'archived'
+              ) AS has_counter_steps,
+              p1.name AS breadcrumb_1, p2.name AS breadcrumb_2,
+              p3.name AS breadcrumb_3, p4.name AS breadcrumb_4,
+              1 - (wt.embedding <=> $1) AS similarity
+       FROM work_types wt
+       LEFT JOIN work_types p4 ON p4.id = wt.parent_id
+       LEFT JOIN work_types p3 ON p3.id = p4.parent_id
+       LEFT JOIN work_types p2 ON p2.id = p3.parent_id
+       LEFT JOIN work_types p1 ON p1.id = p2.parent_id
+       WHERE wt.level = 5 AND wt.status <> 'archived' AND wt.is_step_item = false
+         AND wt.embedding IS NOT NULL
+       ORDER BY wt.embedding <=> $1
+       LIMIT $2`,
+      [vectorLiteral, limit]
+    );
+
+    const items = rows.map((row) => {
+      const { breadcrumb_1: b1, breadcrumb_2: b2, breadcrumb_3: b3, breadcrumb_4: b4, similarity, ...item } = row;
+      return {
+        ...item,
+        breadcrumb: dedupeBreadcrumb([b1, b2, b3, b4].filter((x) => x != null)),
+        similarity: Number(similarity),
+      };
+    });
+
+    res.json({ items });
+  }),
+);
+
 // Каскадное редактирование дерева (только admin/curator).
 // ---------------------------------------------------------------------------
 
@@ -864,6 +925,7 @@ workTypesTreeRouter.patch(
 
       const detail = await buildLeafDetail(pool, id);
       res.json(detail);
+      if (embeddingTextChanged(current, updatedRow)) scheduleEmbeddingRefresh(id);
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       throw err;
@@ -1108,6 +1170,7 @@ workTypesTreeRouter.post(
 
       await client.query("COMMIT");
       res.status(201).json({ items: created });
+      scheduleEmbeddingRefresh(createdIds);
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       throw err;
