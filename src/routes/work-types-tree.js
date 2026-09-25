@@ -33,7 +33,7 @@ export const workTypesTreeRouter = Router();
 
 // /search-smart: если лучший similarity ступени A ниже порога — включается
 // ступень B (реранк топ-кандидатов через DeepSeek).
-const SEARCH_SMART_RERANK_THRESHOLD = 0.5;
+const SEARCH_SMART_RERANK_THRESHOLD = 0.8;
 const SEARCH_SMART_RERANK_CANDIDATES = 20;
 
 const TREE_COLUMNS = `
@@ -585,7 +585,12 @@ workTypesTreeRouter.get(
     });
 
     // Ступень B: реранк через DeepSeek, только если ступень A не уверена.
-    if (items.length > 0 && items[0].similarity < SEARCH_SMART_RERANK_THRESHOLD) {
+    // forceRerank=1 — временный флаг для ручной проверки качества реранка.
+    const forceRerank = req.query.forceRerank === "1";
+    if (
+      items.length > 0 &&
+      (forceRerank || items[0].similarity < SEARCH_SMART_RERANK_THRESHOLD)
+    ) {
       const candidates = items.slice(0, SEARCH_SMART_RERANK_CANDIDATES);
       const relevance = await rerankCandidates(query, candidates);
       if (relevance) {
