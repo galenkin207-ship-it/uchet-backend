@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { pool } from "../db.js";
 import { getEmbedding } from "../openai.js";
+import { rerankCandidates } from "../deepseek.js";
 import { requireAuth, requireRole, isAdminLike } from "../auth.js";
 import { asyncHandler } from "../async-handler.js";
 import { insertAuditLog } from "../audit.js";
@@ -29,6 +30,11 @@ import {
 // admin/curator; PATCH .../edit правки существующей позиции — только admin;
 // остальные POST/PATCH .../nodes — см. requireRole на каждом хендлере).
 export const workTypesTreeRouter = Router();
+
+// /search-smart: если лучший similarity ступени A ниже порога — включается
+// ступень B (реранк топ-кандидатов через DeepSeek).
+const SEARCH_SMART_RERANK_THRESHOLD = 0.5;
+const SEARCH_SMART_RERANK_CANDIDATES = 20;
 
 const TREE_COLUMNS = `
   id, name, level, parent_id, unit, price, has_price, gesn_code, catalog_type,
@@ -524,6 +530,9 @@ workTypesTreeRouter.get(
 // с embedding каждой листовой позиции по косинусной близости (оператор <=>,
 // использует HNSW-индекс work_types_embedding_hnsw_idx). Возвращает те же поля,
 // что и обычный /search, плюс similarity вместо score (чем больше — тем ближе).
+// Ступень B: если лучший similarity < SEARCH_SMART_RERANK_THRESHOLD, топ-20
+// кандидатов реранкаются через DeepSeek (src/deepseek.js) — items получают
+// relevance, в ответе reranked: true. При ошибке реранка — порядок ступени A.
 workTypesTreeRouter.get(
   "/search-smart",
   requireAuth,
@@ -537,7 +546,8 @@ workTypesTreeRouter.get(
     if (!Number.isFinite(limit) || limit <= 0) limit = 20;
     limit = Math.min(Math.trunc(limit), 50);
 
-    const queryEmbedding = await getEmbedding(String(rawQuery).trim());
+    const query = String(rawQuery).trim();
+    const queryEmbedding = await getEmbedding(query);
     const vectorLiteral = JSON.stringify(queryEmbedding);
 
     const { rows } = await pool.query(
@@ -561,7 +571,8 @@ workTypesTreeRouter.get(
          AND wt.embedding IS NOT NULL
        ORDER BY wt.embedding <=> $1
        LIMIT $2`,
-      [vectorLiteral, limit]
+      // Минимум топ-20 — чтобы ступени B было из чего реранкать.
+      [vectorLiteral, Math.max(limit, SEARCH_SMART_RERANK_CANDIDATES)]
     );
 
     const items = rows.map((row) => {
@@ -573,7 +584,25 @@ workTypesTreeRouter.get(
       };
     });
 
-    res.json({ items });
+    // Ступень B: реранк через DeepSeek, только если ступень A не уверена.
+    if (items.length > 0 && items[0].similarity < SEARCH_SMART_RERANK_THRESHOLD) {
+      const candidates = items.slice(0, SEARCH_SMART_RERANK_CANDIDATES);
+      const relevance = await rerankCandidates(query, candidates);
+      if (relevance) {
+        // Кандидаты без оценки от модели — в конец, в исходном порядке similarity.
+        const reranked = candidates
+          .map((item) => ({ ...item, relevance: relevance.get(Number(item.id)) ?? null }))
+          .sort((a, b) => (b.relevance ?? -1) - (a.relevance ?? -1));
+        const rest = items.slice(SEARCH_SMART_RERANK_CANDIDATES);
+        return res.json({ items: [...reranked, ...rest].slice(0, limit), reranked: true });
+      }
+      console.error(
+        `[search-smart] реранк не удался (top similarity=${items[0].similarity.toFixed(3)}), ` +
+          "отдаём порядок ступени A"
+      );
+    }
+
+    res.json({ items: items.slice(0, limit), reranked: false });
   }),
 );
 
