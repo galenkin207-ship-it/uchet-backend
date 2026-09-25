@@ -12,9 +12,17 @@ const RERANK_TIMEOUT_MS = 10_000;
 // (context caching), это резко снижает стоимость повторных вызовов.
 const RERANK_SYSTEM_PROMPT = `Ты помогаешь подобрать позицию из строительного справочника ГЭСН по разговорному описанию работы от прораба.
 Тебе дан запрос прораба и список кандидатов (id, название, вариант, путь в каталоге, код ГЭСН).
-Оцени релевантность каждого кандидата запросу по шкале от 0 до 1, где 1 — позиция точно описывает запрошенную работу, 0 — не имеет к ней отношения.
-Учитывай, что прораб может использовать бытовые формулировки, не совпадающие дословно с официальными терминами ГЭСН.
-Верни только JSON вида {"results":[{"id":number,"relevance":number}]}, отсортированный по убыванию релевантности, с оценкой для каждого кандидата из списка.`;
+Для каждого кандидата определи уровень уверенности confidence — насколько позиция по смыслу соответствует запрошенной работе:
+- "exact" — та же самая работа: совпадают конкретное действие, конструкция, материал и единица измерения (формулировки могут отличаться).
+- "likely" — вероятно подходит, но есть неопределённость: в запросе не указан материал, размер, тип конструкции или другой параметр, от которого зависит точный выбор позиции.
+- "similar" — похожая тематика, но другая работа (другое действие, конструкция или материал); годится только для справки.
+Оценивай смысловое соответствие — единицу измерения, материал, конкретную конструкцию и действие, — а НЕ текстовое сходство и не общую тематику. Похожие слова сами по себе не основание для "exact".
+Пример логики: запрос и кандидат относятся к одной общей теме (например, оба про крепёж), но размер и материал в запросе не подтверждают именно эту позицию — это "likely", а не "exact".
+Прораб может использовать бытовые формулировки, не совпадающие дословно с официальными терминами ГЭСН, — учитывай это.
+Верни только JSON вида {"results":[{"id":number,"confidence":"exact"|"likely"|"similar"}]} с оценкой для каждого кандидата из списка.`;
+
+// Уровни уверенности от лучшего к худшему — порядок сортировки при реранке.
+export const CONFIDENCE_LEVELS = ["exact", "likely", "similar"];
 
 let clientPromise = null;
 
@@ -34,7 +42,8 @@ async function getClient() {
 }
 
 // candidates — [{id, name, variant_label, breadcrumb, gesn_code, similarity}].
-// Возвращает Map<id, relevance> или null при любой ошибке (нет ключа, таймаут,
+// Возвращает Map<id, confidence> ("exact" | "likely" | "similar") для каждого
+// кандидата (без оценки от модели — "similar") или null при любой ошибке (нет ключа, таймаут,
 // ошибка API, невалидный JSON) — наружу не бросает.
 export async function rerankCandidates(query, candidates) {
   try {
@@ -85,17 +94,20 @@ export async function rerankCandidates(query, candidates) {
     }
 
     const allowedIds = new Set(candidates.map((c) => Number(c.id)));
-    const relevance = new Map();
+    const rated = new Map();
     for (const r of parsed.results) {
       const id = Number(r?.id);
-      const score = Number(r?.relevance);
-      if (allowedIds.has(id) && Number.isFinite(score)) relevance.set(id, score);
+      if (allowedIds.has(id) && CONFIDENCE_LEVELS.includes(r?.confidence)) {
+        rated.set(id, r.confidence);
+      }
     }
-    if (relevance.size === 0) {
+    if (rated.size === 0) {
       console.error("[deepseek rerank] ни одной валидной оценки в ответе:", content);
       return null;
     }
-    return relevance;
+    const confidence = new Map();
+    for (const id of allowedIds) confidence.set(id, rated.get(id) ?? "similar");
+    return confidence;
   } catch (err) {
     console.error("[deepseek rerank] ошибка:", err?.name, err?.message);
     return null;

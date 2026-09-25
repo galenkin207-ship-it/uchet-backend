@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { pool } from "../db.js";
 import { getEmbedding } from "../openai.js";
-import { rerankCandidates } from "../deepseek.js";
+import { rerankCandidates, CONFIDENCE_LEVELS } from "../deepseek.js";
 import { requireAuth, requireRole, isAdminLike } from "../auth.js";
 import { asyncHandler } from "../async-handler.js";
 import { insertAuditLog } from "../audit.js";
@@ -530,9 +530,11 @@ workTypesTreeRouter.get(
 // с embedding каждой листовой позиции по косинусной близости (оператор <=>,
 // использует HNSW-индекс work_types_embedding_hnsw_idx). Возвращает те же поля,
 // что и обычный /search, плюс similarity вместо score (чем больше — тем ближе).
-// Ступень B: если лучший similarity < SEARCH_SMART_RERANK_THRESHOLD, топ-20
-// кандидатов реранкаются через DeepSeek (src/deepseek.js) — items получают
-// relevance, в ответе reranked: true. При ошибке реранка — порядок ступени A.
+// Ступень B: если лучший similarity < SEARCH_SMART_RERANK_THRESHOLD или
+// передан mode=ai, топ-20 кандидатов реранкаются через DeepSeek
+// (src/deepseek.js) — items получают confidence ("exact"/"likely"/"similar"),
+// в ответе reranked: true. Без реранка или при его ошибке — порядок ступени A,
+// confidence: null, reranked: false.
 workTypesTreeRouter.get(
   "/search-smart",
   requireAuth,
@@ -584,21 +586,25 @@ workTypesTreeRouter.get(
       };
     });
 
-    // Ступень B: реранк через DeepSeek, только если ступень A не уверена.
-    // forceRerank=1 — временный флаг для ручной проверки качества реранка.
-    const forceRerank = req.query.forceRerank === "1";
+    // Ступень B: реранк через DeepSeek, если ступень A не уверена либо
+    // явно запрошен ИИ-поиск (mode=ai — кнопка «Поиск ИИ» на фронте).
+    const aiMode = req.query.mode === "ai";
     if (
       items.length > 0 &&
-      (forceRerank || items[0].similarity < SEARCH_SMART_RERANK_THRESHOLD)
+      (aiMode || items[0].similarity < SEARCH_SMART_RERANK_THRESHOLD)
     ) {
       const candidates = items.slice(0, SEARCH_SMART_RERANK_CANDIDATES);
-      const relevance = await rerankCandidates(query, candidates);
-      if (relevance) {
-        // Кандидаты без оценки от модели — в конец, в исходном порядке similarity.
+      const confidence = await rerankCandidates(query, candidates);
+      if (confidence) {
+        // exact → likely → similar, внутри группы — по similarity ступени A
+        // (candidates уже в этом порядке, sort стабильный).
+        const rank = (item) => CONFIDENCE_LEVELS.indexOf(item.confidence);
         const reranked = candidates
-          .map((item) => ({ ...item, relevance: relevance.get(Number(item.id)) ?? null }))
-          .sort((a, b) => (b.relevance ?? -1) - (a.relevance ?? -1));
-        const rest = items.slice(SEARCH_SMART_RERANK_CANDIDATES);
+          .map((item) => ({ ...item, confidence: confidence.get(Number(item.id)) }))
+          .sort((a, b) => rank(a) - rank(b));
+        const rest = items
+          .slice(SEARCH_SMART_RERANK_CANDIDATES)
+          .map((item) => ({ ...item, confidence: null }));
         return res.json({ items: [...reranked, ...rest].slice(0, limit), reranked: true });
       }
       console.error(
@@ -607,7 +613,10 @@ workTypesTreeRouter.get(
       );
     }
 
-    res.json({ items: items.slice(0, limit), reranked: false });
+    res.json({
+      items: items.slice(0, limit).map((item) => ({ ...item, confidence: null })),
+      reranked: false,
+    });
   }),
 );
 
