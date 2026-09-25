@@ -4,6 +4,8 @@
 // чтобы оба роутера могли переиспользовать логику без циклического импорта
 // друг друга.
 
+import { pool } from "../db.js";
+
 export function validatePrice(price) {
   if (price == null) return null;
   const n = Number(price);
@@ -318,4 +320,52 @@ export async function archiveWorkType(executor, id) {
     [id],
   );
   return { before, after: rows[0] };
+}
+
+// Текст для эмбеддинга листа — тот же, что в scripts/index-embeddings.js.
+function buildEmbeddingText(row) {
+  return [row.name, row.variant_label, row.work_composition].filter(Boolean).join(". ");
+}
+
+// Поля, от которых зависит текст эмбеддинга (для проверки «изменилось ли»).
+const EMBEDDING_TEXT_FIELDS = ["name", "variant_label", "work_composition"];
+
+export function embeddingTextChanged(before, after) {
+  return EMBEDDING_TEXT_FIELDS.some((f) => (before?.[f] ?? null) !== (after?.[f] ?? null));
+}
+
+async function refreshEmbeddings(ids) {
+  // Текст берём из БД уже после COMMIT — финальные значения; не-листья и
+  // шаговые строки отсекаются здесь же (им эмбеддинг не нужен).
+  const { rows } = await pool.query(
+    `SELECT id, gesn_code, name, variant_label, work_composition
+       FROM work_types
+      WHERE id = ANY($1) AND level = 5 AND is_step_item = false`,
+    [ids],
+  );
+  if (!rows.length) return;
+  // Ленивый импорт: new OpenAI() в openai.js бросает без OPENAI_API_KEY, а этот
+  // модуль импортируют и офлайн-скрипты (scripts/test-build-leaf-name.js).
+  const { getEmbedding } = await import("../openai.js");
+  for (const row of rows) {
+    try {
+      const vector = await getEmbedding(buildEmbeddingText(row));
+      await pool.query(`UPDATE work_types SET embedding = $1 WHERE id = $2`, [JSON.stringify(vector), row.id]);
+    } catch (err) {
+      console.error(`Не удалось пересчитать эмбеддинг work_types id=${row.id} gesn_code=${row.gesn_code ?? "-"}:`, err.message);
+    }
+  }
+}
+
+// Фоновый пересчёт эмбеддинга (для /search-smart) после создания/правки
+// листа. Вызывать ПОСЛЕ отправки ответа: не ждём, ошибки только в лог —
+// на запрос и процесс сбой OpenAI/UPDATE не влияет.
+export function scheduleEmbeddingRefresh(ids) {
+  const list = (Array.isArray(ids) ? ids : [ids]).map(Number).filter(Number.isInteger);
+  if (!list.length) return;
+  setImmediate(() => {
+    refreshEmbeddings(list).catch((err) => {
+      console.error(`Не удалось пересчитать эмбеддинги work_types ids=${list.join(",")}:`, err.message);
+    });
+  });
 }

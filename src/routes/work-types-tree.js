@@ -16,6 +16,8 @@ import {
   loadLeafParent,
   insertLeaf,
   buildLeafName,
+  embeddingTextChanged,
+  scheduleEmbeddingRefresh,
 } from "./work-types-shared.js";
 
 // Роутер поверх древовидной структуры work_types (level, parent_id,
@@ -923,6 +925,7 @@ workTypesTreeRouter.patch(
 
       const detail = await buildLeafDetail(pool, id);
       res.json(detail);
+      if (embeddingTextChanged(current, updatedRow)) scheduleEmbeddingRefresh(id);
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       throw err;
@@ -1167,6 +1170,7 @@ workTypesTreeRouter.post(
 
       await client.query("COMMIT");
       res.status(201).json({ items: created });
+      scheduleEmbeddingRefresh(createdIds);
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       throw err;
