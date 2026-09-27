@@ -35,6 +35,20 @@ export const workTypesTreeRouter = Router();
 // ступень B (реранк топ-кандидатов через DeepSeek).
 const SEARCH_SMART_RERANK_THRESHOLD = 0.8;
 const SEARCH_SMART_RERANK_CANDIDATES = 20;
+// Гибридные кандидаты для ступени B: сверх топа pgvector добавляем до стольких
+// позиций, найденных текстовым совпадением по специфическим словам запроса.
+const SEARCH_SMART_KEYWORD_CANDIDATES = 10;
+const SEARCH_SMART_MAX_KEYWORDS = 6;
+
+// Основы частотных «общих» слов (действия, служебные слова каталога), которые
+// есть в названиях множества позиций и не сужают поиск. Слово запроса,
+// начинающееся с любой из этих основ, в ключевые не попадает.
+const SEARCH_SMART_STOP_STEMS = [
+  "монтаж", "демонтаж", "смонтир", "установ", "устройств", "укладк", "уложит",
+  "креплен", "закреп", "прокладк", "проложит", "разборк", "разобрат", "сняти",
+  "снять", "замен", "ремонт", "материал", "работ", "сделат", "постав",
+  "издели", "конструкц", "размер", "толщин", "диаметр", "площад",
+];
 
 const TREE_COLUMNS = `
   id, name, level, parent_id, unit, price, has_price, gesn_code, catalog_type,
@@ -419,6 +433,23 @@ function parseSearchQuery(rawQuery) {
 // чем меньше — тем выше в выдаче; типичный score текста — десятки-сотни).
 const EXACT_CODE_SCORE_BONUS = 10000;
 
+// Специфические ключевые слова запроса для гибридных кандидатов /search-smart.
+// Эмбеддинги переоценивают частые слова («монтаж», «установка») и недооценивают
+// редкие термины («фиксаторами»), поэтому такие слова дополнительно ищем
+// текстом. Берём слова от 5 букв, кроме стоп-основ; слово обрезаем до основы
+// (минус 3 последние буквы, но не короче 4), чтобы ловить другие падежи:
+// «фиксаторами» → «фиксатор», «кровли» → «кров», «стену» → «стен».
+function extractKeywordStems(query) {
+  const stems = [];
+  for (const word of normalize(query).split(/[^a-zа-я0-9]+/)) {
+    if (word.length < 5) continue;
+    if (SEARCH_SMART_STOP_STEMS.some((stop) => word.startsWith(stop))) continue;
+    const stem = word.slice(0, Math.max(4, word.length - 3));
+    if (!stems.includes(stem)) stems.push(stem);
+  }
+  return stems.slice(0, SEARCH_SMART_MAX_KEYWORDS);
+}
+
 // GET /search?q=<строка>&limit=<число, по умолчанию 50, максимум 200>
 // Двухэтапно: SQL сужает кандидатов до level=5 позиций, содержащих все
 // токены (верхняя защитная граница LIMIT 500, не финальная выдача), затем
@@ -525,13 +556,94 @@ workTypesTreeRouter.get(
 );
 
 // ---------------------------------------------------------------------------
+// Общие части SELECT/FROM для /search-smart (ступень A и текстовые кандидаты).
+// $1 — вектор запроса; у позиции без эмбеддинга similarity = NULL.
+const SEARCH_SMART_SELECT = `
+  wt.id, wt.name, wt.level, wt.parent_id, wt.unit, wt.price, wt.has_price,
+  wt.gesn_code, wt.catalog_type, wt.is_step_item, wt.step_unit_label,
+  wt.work_composition, wt.labor_hours, wt.source, wt.variant_label,
+  EXISTS (
+    SELECT 1 FROM work_types s
+    WHERE s.step_base_work_type_id = wt.id AND s.is_counter_step = true
+      AND s.status <> 'archived'
+  ) AS has_counter_steps,
+  p1.name AS breadcrumb_1, p2.name AS breadcrumb_2,
+  p3.name AS breadcrumb_3, p4.name AS breadcrumb_4,
+  1 - (wt.embedding <=> $1) AS similarity
+`;
+const SEARCH_SMART_FROM = `
+  FROM work_types wt
+  LEFT JOIN work_types p4 ON p4.id = wt.parent_id
+  LEFT JOIN work_types p3 ON p3.id = p4.parent_id
+  LEFT JOIN work_types p2 ON p2.id = p3.parent_id
+  LEFT JOIN work_types p1 ON p1.id = p2.parent_id
+`;
+
+function toSearchSmartItem(row) {
+  const { breadcrumb_1: b1, breadcrumb_2: b2, breadcrumb_3: b3, breadcrumb_4: b4, similarity, ...item } = row;
+  return {
+    ...item,
+    breadcrumb: dedupeBreadcrumb([b1, b2, b3, b4].filter((x) => x != null)),
+    similarity: similarity == null ? 0 : Number(similarity),
+  };
+}
+
+// Кандидаты для ступени B: топ pgvector + до SEARCH_SMART_KEYWORD_CANDIDATES
+// позиций с текстовым совпадением по специфическим словам запроса (см.
+// extractKeywordStems), сначала — где совпало больше слов. Дедупликация по id.
+// Каждый кандидат получает keywordMatch: есть ли в его названии хотя бы одно
+// специфическое слово запроса (подсказка реранкеру, клиенту не отдаётся).
+async function buildHybridCandidates(query, vectorLiteral, vectorCandidates) {
+  const stems = extractKeywordStems(query);
+  if (stems.length === 0) {
+    return vectorCandidates.map((c) => ({ ...c, keywordMatch: false }));
+  }
+
+  // ё → е и в названии, и в основах (normalize), иначе ILIKE их не сопоставит.
+  const nameExpr = "replace(lower(wt.name), 'ё', 'е')";
+  const params = [vectorLiteral, ...stems.map((stem) => `%${stem}%`)];
+  const likes = stems.map((_, i) => `${nameExpr} LIKE $${i + 2}`);
+  const hitsExpr = likes.map((l) => `(CASE WHEN ${l} THEN 1 ELSE 0 END)`).join(" + ");
+  params.push(SEARCH_SMART_KEYWORD_CANDIDATES);
+
+  const { rows } = await pool.query(
+    `SELECT ${SEARCH_SMART_SELECT}, ${hitsExpr} AS keyword_hits
+     ${SEARCH_SMART_FROM}
+     WHERE wt.level = 5 AND wt.status <> 'archived' AND wt.is_step_item = false
+       AND (${likes.join(" OR ")})
+     ORDER BY keyword_hits DESC, similarity DESC NULLS LAST, wt.id
+     LIMIT $${params.length}`,
+    params
+  );
+
+  const hasKeyword = (name) => {
+    const normName = normalize(name);
+    return stems.some((stem) => normName.includes(stem));
+  };
+  const candidates = vectorCandidates.map((c) => ({ ...c, keywordMatch: hasKeyword(c.name) }));
+  const seen = new Set(candidates.map((c) => c.id));
+  for (const row of rows) {
+    if (seen.has(row.id)) continue;
+    const { keyword_hits: _hits, ...rest } = row;
+    candidates.push({ ...toSearchSmartItem(rest), keywordMatch: true });
+    seen.add(row.id);
+  }
+  console.log(
+    `[search-smart] ключевые основы: [${stems.join(", ")}], ` +
+      `текстовых кандидатов: ${rows.length}, новых сверх pgvector: ${candidates.length - vectorCandidates.length}`
+  );
+  return candidates;
+}
+
 // GET /search-smart?q=<строка> — семантический поиск через эмбеддинги (ступень A).
 // Запрос превращается в вектор (OpenAI text-embedding-3-small) и сравнивается
 // с embedding каждой листовой позиции по косинусной близости (оператор <=>,
 // использует HNSW-индекс work_types_embedding_hnsw_idx). Возвращает те же поля,
 // что и обычный /search, плюс similarity вместо score (чем больше — тем ближе).
 // Ступень B: если лучший similarity < SEARCH_SMART_RERANK_THRESHOLD или
-// передан mode=ai, топ-20 кандидатов реранкаются через DeepSeek
+// передан mode=ai, топ-20 кандидатов pgvector плюс до 10 позиций с текстовым
+// совпадением по специфическим словам запроса (buildHybridCandidates)
+// реранкаются через DeepSeek
 // (src/deepseek.js) — items получают confidence ("exact"/"likely"/"similar"),
 // в ответе reranked: true. Без реранка или при его ошибке — порядок ступени A,
 // confidence: null, reranked: false.
@@ -553,22 +665,8 @@ workTypesTreeRouter.get(
     const vectorLiteral = JSON.stringify(queryEmbedding);
 
     const { rows } = await pool.query(
-      `SELECT wt.id, wt.name, wt.level, wt.parent_id, wt.unit, wt.price, wt.has_price,
-              wt.gesn_code, wt.catalog_type, wt.is_step_item, wt.step_unit_label,
-              wt.work_composition, wt.labor_hours, wt.source, wt.variant_label,
-              EXISTS (
-                SELECT 1 FROM work_types s
-                WHERE s.step_base_work_type_id = wt.id AND s.is_counter_step = true
-                  AND s.status <> 'archived'
-              ) AS has_counter_steps,
-              p1.name AS breadcrumb_1, p2.name AS breadcrumb_2,
-              p3.name AS breadcrumb_3, p4.name AS breadcrumb_4,
-              1 - (wt.embedding <=> $1) AS similarity
-       FROM work_types wt
-       LEFT JOIN work_types p4 ON p4.id = wt.parent_id
-       LEFT JOIN work_types p3 ON p3.id = p4.parent_id
-       LEFT JOIN work_types p2 ON p2.id = p3.parent_id
-       LEFT JOIN work_types p1 ON p1.id = p2.parent_id
+      `SELECT ${SEARCH_SMART_SELECT}
+       ${SEARCH_SMART_FROM}
        WHERE wt.level = 5 AND wt.status <> 'archived' AND wt.is_step_item = false
          AND wt.embedding IS NOT NULL
        ORDER BY wt.embedding <=> $1
@@ -577,14 +675,7 @@ workTypesTreeRouter.get(
       [vectorLiteral, Math.max(limit, SEARCH_SMART_RERANK_CANDIDATES)]
     );
 
-    const items = rows.map((row) => {
-      const { breadcrumb_1: b1, breadcrumb_2: b2, breadcrumb_3: b3, breadcrumb_4: b4, similarity, ...item } = row;
-      return {
-        ...item,
-        breadcrumb: dedupeBreadcrumb([b1, b2, b3, b4].filter((x) => x != null)),
-        similarity: Number(similarity),
-      };
-    });
+    const items = rows.map(toSearchSmartItem);
 
     // Ступень B: реранк через DeepSeek, если ступень A не уверена либо
     // явно запрошен ИИ-поиск (mode=ai — кнопка «Поиск ИИ» на фронте).
@@ -593,17 +684,24 @@ workTypesTreeRouter.get(
       items.length > 0 &&
       (aiMode || items[0].similarity < SEARCH_SMART_RERANK_THRESHOLD)
     ) {
-      const candidates = items.slice(0, SEARCH_SMART_RERANK_CANDIDATES);
+      const candidates = await buildHybridCandidates(
+        query,
+        vectorLiteral,
+        items.slice(0, SEARCH_SMART_RERANK_CANDIDATES)
+      );
       const confidence = await rerankCandidates(query, candidates);
       if (confidence) {
         // exact → likely → similar, внутри группы — по similarity ступени A
-        // (candidates уже в этом порядке, sort стабильный).
+        // (sort стабильный; у текстовых кандидатов без эмбеддинга similarity 0).
+        // keywordMatch — только для промпта, клиенту не отдаём.
         const rank = (item) => CONFIDENCE_LEVELS.indexOf(item.confidence);
+        const candidateIds = new Set(candidates.map((c) => c.id));
         const reranked = candidates
-          .map((item) => ({ ...item, confidence: confidence.get(Number(item.id)) }))
-          .sort((a, b) => rank(a) - rank(b));
+          .map(({ keywordMatch, ...item }) => ({ ...item, confidence: confidence.get(Number(item.id)) }))
+          .sort((a, b) => rank(a) - rank(b) || b.similarity - a.similarity);
         const rest = items
           .slice(SEARCH_SMART_RERANK_CANDIDATES)
+          .filter((item) => !candidateIds.has(item.id))
           .map((item) => ({ ...item, confidence: null }));
         return res.json({ items: [...reranked, ...rest].slice(0, limit), reranked: true });
       }
