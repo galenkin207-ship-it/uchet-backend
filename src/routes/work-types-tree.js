@@ -50,6 +50,22 @@ const SEARCH_SMART_STOP_STEMS = [
   "издели", "конструкц", "размер", "толщин", "диаметр", "площад",
 ];
 
+// Группы синонимов строительной лексики (основы, после normalize: ё → е).
+// Если слово запроса содержит основу из группы, в текстовый поиск идут все
+// основы группы — независимо от стоп-листа выше (так «крепление» само по себе
+// остаётся общим словом, но подтягивает «фиксатор», «хомут» и т.д.).
+// Только настоящие синонимы: противоположные действия (монтаж / демонтаж)
+// в одну группу не объединять.
+const SYNONYM_GROUPS = [
+  ["фиксатор", "фиксац", "креплен", "крепеж", "зажим", "держател", "хомут", "скоб"],
+  ["демонтаж", "снят", "разбор", "разобра"],
+  ["облицовк", "обшивк"],
+  ["заделк", "герметиз", "уплотнен"],
+  ["выравниван", "нивелир"],
+  ["шпатлевк", "шпаклевк"],
+  ["окраск", "покраск"],
+];
+
 const TREE_COLUMNS = `
   id, name, level, parent_id, unit, price, has_price, gesn_code, catalog_type,
   is_step_item, step_unit_label, step_base_work_type_id, work_composition,
@@ -439,15 +455,41 @@ const EXACT_CODE_SCORE_BONUS = 10000;
 // текстом. Берём слова от 5 букв, кроме стоп-основ; слово обрезаем до основы
 // (минус 3 последние буквы, но не короче 4), чтобы ловить другие падежи:
 // «фиксаторами» → «фиксатор», «кровли» → «кров», «стену» → «стен».
+// Отдельной проверкой (без стоп-листа) слова запроса сверяются с
+// SYNONYM_GROUPS (основы группы захардкожены полностью, автоматическое
+// усечение на них не влияет): сработавшая группа целиком становится одним
+// «понятием». Слово вне групп — отдельное понятие из одной своей основы.
+// Лимит SEARCH_SMART_MAX_KEYWORDS — только на понятия вне групп.
+// Возвращает concepts (массив массивов основ — единица подсчёта совпадений),
+// stems (основы слов запроса) и synonyms (основы, добавленные группами).
 function extractKeywordStems(query) {
+  const words = normalize(query).split(/[^a-zа-я0-9]+/).filter(Boolean);
   const stems = [];
-  for (const word of normalize(query).split(/[^a-zа-я0-9]+/)) {
-    if (word.length < 5) continue;
-    if (SEARCH_SMART_STOP_STEMS.some((stop) => word.startsWith(stop))) continue;
-    const stem = word.slice(0, Math.max(4, word.length - 3));
-    if (!stems.includes(stem)) stems.push(stem);
+  const groupConcepts = new Map(); // индекс группы → основы понятия
+  const plainConcepts = [];
+  for (const word of words) {
+    const isStop = word.length < 5 || SEARCH_SMART_STOP_STEMS.some((stop) => word.startsWith(stop));
+    const stem = isStop ? null : word.slice(0, Math.max(4, word.length - 3));
+    if (stem && !stems.includes(stem)) stems.push(stem);
+
+    let inGroup = false;
+    SYNONYM_GROUPS.forEach((group, i) => {
+      if (!group.some((syn) => word.includes(syn))) return;
+      inGroup = true;
+      if (!groupConcepts.has(i)) groupConcepts.set(i, [...group]);
+      // Собственная основа слова («покра» из «покраска») — часть того же понятия.
+      const concept = groupConcepts.get(i);
+      if (stem && !concept.includes(stem)) concept.push(stem);
+    });
+    if (!inGroup && stem && !plainConcepts.some((c) => c[0] === stem)) {
+      plainConcepts.push([stem]);
+    }
   }
-  return stems.slice(0, SEARCH_SMART_MAX_KEYWORDS);
+
+  const concepts = [...plainConcepts.slice(0, SEARCH_SMART_MAX_KEYWORDS), ...groupConcepts.values()];
+  const usedStems = stems.filter((stem) => concepts.some((c) => c.includes(stem)));
+  const synonyms = [...new Set(concepts.flat())].filter((stem) => !usedStems.includes(stem));
+  return { concepts, stems: usedStems, synonyms };
 }
 
 // GET /search?q=<строка>&limit=<число, по умолчанию 50, максимум 200>
@@ -594,7 +636,8 @@ function toSearchSmartItem(row) {
 // Каждый кандидат получает keywordMatch: есть ли в его названии хотя бы одно
 // специфическое слово запроса (подсказка реранкеру, клиенту не отдаётся).
 async function buildHybridCandidates(query, vectorLiteral, vectorCandidates) {
-  const stems = extractKeywordStems(query);
+  const { concepts, stems: queryStems, synonyms } = extractKeywordStems(query);
+  const stems = [...new Set(concepts.flat())];
   if (stems.length === 0) {
     return vectorCandidates.map((c) => ({ ...c, keywordMatch: false }));
   }
@@ -603,7 +646,12 @@ async function buildHybridCandidates(query, vectorLiteral, vectorCandidates) {
   const nameExpr = "replace(lower(wt.name), 'ё', 'е')";
   const params = [vectorLiteral, ...stems.map((stem) => `%${stem}%`)];
   const likes = stems.map((_, i) => `${nameExpr} LIKE $${i + 2}`);
-  const hitsExpr = likes.map((l) => `(CASE WHEN ${l} THEN 1 ELSE 0 END)`).join(" + ");
+  const likeOf = (stem) => likes[stems.indexOf(stem)];
+  // keyword_hits — число совпавших понятий: синонимы одной группы в названии
+  // засчитываются один раз.
+  const hitsExpr = concepts
+    .map((concept) => `(CASE WHEN ${concept.map(likeOf).join(" OR ")} THEN 1 ELSE 0 END)`)
+    .join(" + ");
   params.push(SEARCH_SMART_KEYWORD_CANDIDATES);
 
   const { rows } = await pool.query(
@@ -629,7 +677,8 @@ async function buildHybridCandidates(query, vectorLiteral, vectorCandidates) {
     seen.add(row.id);
   }
   console.log(
-    `[search-smart] ключевые основы: [${stems.join(", ")}], ` +
+    `[search-smart] ключевые основы: [${queryStems.join(", ")}], ` +
+      `синонимы добавлены: [${synonyms.join(", ")}], ` +
       `текстовых кандидатов: ${rows.length}, новых сверх pgvector: ${candidates.length - vectorCandidates.length}`
   );
   return candidates;
