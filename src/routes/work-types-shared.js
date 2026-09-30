@@ -43,11 +43,14 @@ export async function cascadeWorkTypeUpdate(client, updated) {
 // сразу, дополнительно скопировано по catalogType, иначе "Раздел А" в каталоге
 // ГЭСН конфликтовал бы с "Раздел А" в другом каталоге.
 //
-// activeOnly — считать конфликтом только неархивных братьев (batch-создание);
-// по умолчанию архивные тоже учитываются, как раньше.
-export async function checkNameUniqueAmongSiblings(executor, { parentId, catalogType, name, excludeId, activeOnly = false }) {
+// Конфликтом считаются только неархивные братья: архивная строка с тем же
+// именем не мешает создать/переименовать/переместить узел или позицию.
+// Активных дублей при этом не появится — PATCH /api/work-types/:id/restore
+// (directories.js) перед возвратом из архива проверяет конфликт с активными.
+// excludeId — сам узел при правке/переименовании.
+export async function checkNameUniqueAmongSiblings(executor, { parentId, catalogType, name, excludeId }) {
   if (!name || !String(name).trim()) return null;
-  const clauses = ["lower(btrim(name)) = lower(btrim($1))"];
+  const clauses = ["lower(btrim(name)) = lower(btrim($1))", "status <> 'archived'"];
   const params = [name];
   if (parentId == null) {
     clauses.push("parent_id IS NULL");
@@ -61,7 +64,6 @@ export async function checkNameUniqueAmongSiblings(executor, { parentId, catalog
     params.push(excludeId);
     clauses.push(`id <> $${params.length}`);
   }
-  if (activeOnly) clauses.push("status <> 'archived'");
   const { rows } = await executor.query(
     `SELECT id FROM work_types WHERE ${clauses.join(" AND ")}`,
     params,
@@ -184,9 +186,8 @@ export async function loadLeafParent(executor, parentId, { forUpdate = false } =
 // Уникальность имени среди братьев и gesn_code в сборнике, затем INSERT листа
 // (level=5, source='manual', status='active'). fields.name/variant_label уже
 // финальные (name — итоговое имя листа). Возвращает { id } или { error }.
-// options.nameConflictMessage — если задан, проверка имени идёт только среди
-// неархивных братьев и при конфликте (в т.ч. на уровне БД) отдаётся этот текст
-// (batch); без options поведение прежнее (одиночный POST).
+// options.nameConflictMessage — если задан, при конфликте имени (в т.ч. на
+// уровне БД) отдаётся этот текст (batch); иначе — стандартный текст проверки.
 export async function insertLeaf(executor, parent, fields, options = {}) {
   const { nameConflictMessage = null } = options;
   const { name, variant_label, unit, price, has_price, labor_hours, gesn_code, work_composition, sort_order } = fields;
@@ -196,7 +197,6 @@ export async function insertLeaf(executor, parent, fields, options = {}) {
     catalogType: parent.catalog_type,
     name,
     excludeId: null,
-    activeOnly: nameConflictMessage != null,
   });
   if (nameError) return { error: { status: 409, error: nameConflictMessage ?? nameError } };
 

@@ -587,7 +587,6 @@ workTypesRouter.patch(
         catalogType: before.catalog_type,
         name: before.name,
         excludeId: before.id,
-        activeOnly: true,
       });
       if (nameError) {
         return res

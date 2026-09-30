@@ -1024,9 +1024,7 @@ workTypesTreeRouter.patch(
       }
 
       // Уникальность имени — только если имя изменилось или лист переехал.
-      // Архивные братья не мешают: иначе архивный дубль с тем же именем
-      // блокирует правку активной позиции. Восстановление из архива
-      // (PATCH /api/work-types/:id/restore) само проверяет активные дубли.
+      // Архивные братья не учитываются (см. checkNameUniqueAmongSiblings).
       // Тот же name в теле (фронт шлёт его при любой правке) изменением не считается.
       const nameChanged =
         "name" in nameFields && nameFields.name !== String(current.name ?? "").trim();
@@ -1036,7 +1034,6 @@ workTypesTreeRouter.patch(
           catalogType: newCatalogType,
           name: nameFields.name ?? current.name,
           excludeId: id,
-          activeOnly: true,
         });
         if (nameError) {
           await client.query("ROLLBACK");
@@ -1411,7 +1408,10 @@ workTypesTreeRouter.patch(
       return res.status(400).json({ error: "Укажите название" });
     }
 
-    if ("name" in body) {
+    // Проверяем только реальное переименование (тот же name в теле — не изменение).
+    const nameChanged =
+      "name" in body && String(finalName).trim() !== String(current.name ?? "").trim();
+    if (nameChanged) {
       const nameError = await checkNameUniqueAmongSiblings(pool, {
         parentId: current.parent_id,
         catalogType: current.catalog_type,
