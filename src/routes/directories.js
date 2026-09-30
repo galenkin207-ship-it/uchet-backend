@@ -9,6 +9,7 @@ import {
   cascadeWorkTypeUpdate,
   buildLeafDetail,
   archiveWorkType,
+  checkNameUniqueAmongSiblings,
   validateLeafInput,
   loadLeafParent,
   insertLeaf,
@@ -570,10 +571,30 @@ workTypesRouter.patch(
   requireRole("admin"),
   asyncHandler(async (req, res) => {
     const { rows: beforeRows } = await pool.query(
-      `SELECT id, name, unit, price, status, archived_at FROM work_types WHERE id = $1`,
+      `SELECT id, name, unit, price, status, archived_at, parent_id, catalog_type
+         FROM work_types WHERE id = $1`,
       [req.params.id],
     );
-    if (!beforeRows[0]) return res.status(404).json({ error: "not found" });
+    const before = beforeRows[0];
+    if (!before) return res.status(404).json({ error: "not found" });
+
+    // Правка позиции не учитывает архивных братьев с тем же именем (см.
+    // PATCH /:id/edit), поэтому при возврате из архива проверяем, что в той же
+    // ветке нет активной позиции с таким названием — не плодим активные дубли.
+    if (before.status === "archived") {
+      const nameError = await checkNameUniqueAmongSiblings(pool, {
+        parentId: before.parent_id,
+        catalogType: before.catalog_type,
+        name: before.name,
+        excludeId: before.id,
+        activeOnly: true,
+      });
+      if (nameError) {
+        return res
+          .status(409)
+          .json({ error: "В этой ветке уже есть активная позиция с таким названием" });
+      }
+    }
 
     const { rows } = await pool.query(
       `UPDATE work_types SET status = 'active', archived_at = NULL

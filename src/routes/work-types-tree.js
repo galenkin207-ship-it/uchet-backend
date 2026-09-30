@@ -1024,12 +1024,19 @@ workTypesTreeRouter.patch(
       }
 
       // Уникальность имени — только если имя изменилось или лист переехал.
-      if ("name" in nameFields || parentChanged) {
+      // Архивные братья не мешают: иначе архивный дубль с тем же именем
+      // блокирует правку активной позиции. Восстановление из архива
+      // (PATCH /api/work-types/:id/restore) само проверяет активные дубли.
+      // Тот же name в теле (фронт шлёт его при любой правке) изменением не считается.
+      const nameChanged =
+        "name" in nameFields && nameFields.name !== String(current.name ?? "").trim();
+      if (nameChanged || parentChanged) {
         const nameError = await checkNameUniqueAmongSiblings(client, {
           parentId: newParentId,
           catalogType: newCatalogType,
           name: nameFields.name ?? current.name,
           excludeId: id,
+          activeOnly: true,
         });
         if (nameError) {
           await client.query("ROLLBACK");
