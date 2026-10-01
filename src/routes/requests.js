@@ -1,9 +1,18 @@
 import { Router } from "express";
 import { pool } from "../db.js";
-import { requireAuth, requireRole } from "../auth.js";
+import { requireAuth, requireRole, isAdminLike } from "../auth.js";
 import { sendPushToRole, sendPushToUser } from "../push-notify.js";
 import { insertAuditLog } from "../audit.js";
 import { asyncHandler } from "../async-handler.js";
+import {
+  validatePrice,
+  loadLeafParent,
+  insertLeaf,
+  resolveLeafName,
+  buildLeafDetail,
+  loadWorkTypePaths,
+  scheduleEmbeddingRefresh,
+} from "./work-types-shared.js";
 
 export const requestsRouter = Router();
 
@@ -18,6 +27,62 @@ async function findUserIdByName(fullName) {
     fullName,
   ]);
   return rows[0]?.id ?? null;
+}
+
+// Поля ответа на заявку для клиента (мастера и админа):
+//   - admin_comment — комментарий админа/куратора: при отклонении — причина
+//     (reject_reason), при выполнении — сообщение мастеру (response_message);
+//   - work_type — позиция справочника, которой закрыта заявка (work_type_id,
+//     миграция 031): название, единица, цена и путь (формат GET
+//     /api/work-types/:id/path, но доступно и мастеру — только чтение).
+//     available=false — позиция с тех пор архивирована (в запись её добавить
+//     нельзя). Если позиция удалена совсем, work_type_id = NULL (ON DELETE SET
+//     NULL) и work_type = null.
+// paths — Map из loadWorkTypePaths.
+function withResponseFields(row, paths) {
+  const path = row.work_type_id != null ? paths.get(Number(row.work_type_id)) : null;
+  return {
+    ...row,
+    admin_comment: row.status === "rejected" ? row.reject_reason ?? null : row.response_message ?? null,
+    work_type: path
+      ? {
+          id: path.leaf.id,
+          name: path.leaf.name,
+          unit: path.unit,
+          price: path.price,
+          available: path.status !== "archived" && path.level === 5,
+          catalog_type: path.catalog_type,
+          levels: path.levels,
+        }
+      : null,
+  };
+}
+
+async function withResponseFieldsList(rows) {
+  const paths = await loadWorkTypePaths(
+    pool,
+    rows.map((r) => r.work_type_id).filter((id) => id != null),
+  );
+  return rows.map((r) => withResponseFields(r, paths));
+}
+
+// Заявка обработана (выполнена/отклонена) — она больше не требует внимания
+// куратора/админа, поэтому связанные с ней уведомления ("новая заявка" +
+// вся переписка по ней) сразу помечаются прочитанными для всех, чтобы не
+// зависали в списке непрочитанных после того, как решение уже принято.
+async function markRequestNotificationsRead(executor, requestId) {
+  await executor.query(
+    `INSERT INTO notification_reads (user_id, item_id)
+     SELECT u.id, item_id
+     FROM users u
+     CROSS JOIN (
+       SELECT $1 || '-new' AS item_id
+       UNION ALL
+       SELECT id::text FROM request_comments WHERE request_id = $2
+     ) items
+     ON CONFLICT DO NOTHING`,
+    [String(requestId), requestId],
+  );
 }
 
 // Полный снимок заявки вместе с перепиской — используется и для GET /:id-подобной
@@ -77,7 +142,7 @@ requestsRouter.get(
     `,
       isForeman ? [req.user.id, req.user.full_name] : [],
     );
-    res.json(rows);
+    res.json(await withResponseFieldsList(rows));
   }),
 );
 
@@ -264,11 +329,29 @@ requestsRouter.post(
   "/",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { text } = req.body || {};
+    const { text, record_id } = req.body || {};
     if (!text) return res.status(400).json({ error: "text is required" });
+
+    // record_id — запись, из формы которой мастер отправил заявку (необязательно).
+    // Нужна только для удобства («Внести в запись» предложит её первой), поэтому
+    // чужую/несуществующую запись молча не привязываем, а не отклоняем заявку.
+    let recordId = null;
+    if (record_id != null && record_id !== "") {
+      const rid = Number(record_id);
+      if (Number.isInteger(rid)) {
+        const { rows: recRows } = await pool.query(
+          `SELECT id, created_by_user_id FROM records WHERE id = $1`,
+          [rid],
+        );
+        const rec = recRows[0];
+        if (rec && (rec.created_by_user_id === req.user.id || isAdminLike(req.user))) recordId = rec.id;
+      }
+    }
+
     const { rows } = await pool.query(
-      `INSERT INTO requests (text, submitted_by, submitted_by_user_id, status) VALUES ($1,$2,$3,'pending') RETURNING *`,
-      [text, req.user.full_name, req.user.id],
+      `INSERT INTO requests (text, submitted_by, submitted_by_user_id, status, record_id)
+       VALUES ($1,$2,$3,'pending',$4) RETURNING *`,
+      [text, req.user.full_name, req.user.id, recordId],
     );
     await insertAuditLog(pool, {
       entityType: "request",
@@ -297,9 +380,11 @@ requestsRouter.post(
 const MAX_RESPONSE_MESSAGE_LENGTH = 2000;
 
 // Одобрение/отклонение — только curator/admin.
-// Одобрение НЕ создаёт и НЕ изменяет строки work_types: позицию куратор/админ
-// добавляет отдельно ("Добавить в справочник"), а здесь пишет мастеру текст
-// (путь и название внесённой позиции) в message → requests.response_message.
+// Отклонение (status='rejected', необязательный reject_reason — комментарий
+// мастеру) — основной путь. Одобрение здесь — только для старых клиентов:
+// новый клиент закрывает заявку через POST /:id/complete (с привязкой к
+// позиции справочника). Одобрение здесь НЕ создаёт и НЕ изменяет строки
+// work_types, а пишет мастеру текст в message → requests.response_message.
 // Старые клиенты могут по-прежнему присылать resolved_name/resolved_unit/
 // resolved_price — они игнорируются (ни в work_types, ни в заявку не пишутся).
 requestsRouter.put(
@@ -349,23 +434,8 @@ requestsRouter.put(
     );
     if (!rows[0]) return res.status(404).json({ error: "not found" });
 
-    // Заявка обработана (одобрена/отклонена) — она больше не требует внимания
-    // куратора/админа, поэтому связанные с ней уведомления ("новая заявка" +
-    // вся переписка по ней) сразу помечаются прочитанными для всех, чтобы не
-    // зависали в списке непрочитанных после того, как решение уже принято.
     if (status === "approved" || status === "rejected") {
-      await pool.query(
-        `INSERT INTO notification_reads (user_id, item_id)
-         SELECT u.id, item_id
-         FROM users u
-         CROSS JOIN (
-           SELECT $1 || '-new' AS item_id
-           UNION ALL
-           SELECT id::text FROM request_comments WHERE request_id = $2
-         ) items
-         ON CONFLICT DO NOTHING`,
-        [req.params.id, req.params.id],
-      );
+      await markRequestNotificationsRead(pool, rows[0].id);
     }
 
     await insertAuditLog(pool, {
@@ -378,7 +448,7 @@ requestsRouter.put(
       after: { ...rows[0], comments: before.comments },
     });
 
-    res.json(rows[0]);
+    res.json((await withResponseFieldsList([rows[0]]))[0]);
 
     const authorId = rows[0].submitted_by_user_id ?? (await findUserIdByName(rows[0].submitted_by));
     if (authorId && (status === "approved" || status === "rejected")) {
@@ -386,6 +456,165 @@ requestsRouter.put(
         title: status === "approved" ? "Заявка одобрена" : "Заявка отклонена",
         body: status === "approved" && rows[0].response_message ? rows[0].response_message : rows[0].text,
         url: `/messages?request=${rows[0].id}`,
+      });
+    }
+  }),
+);
+
+// POST /:id/complete — закрыть заявку позицией справочника (curator/admin, как
+// и одобрение в PUT /:id). Тело — ЛИБО { work_type_id } (выбор существующей
+// позиции), ЛИБО { new_work_type: { parent_id, text, unit, price, has_price,
+// labor_hours, gesn_code, work_composition } } — новая позиция по тем же
+// правилам, что и строка POST /api/work-types/batch (имя считает сервер:
+// под группой text — вариант, иначе полное название). Необязательный comment —
+// сообщение мастеру (requests.response_message, до MAX_RESPONSE_MESSAGE_LENGTH).
+// Создание позиции, привязка к заявке и смена статуса на approved — одна
+// транзакция: при любой ошибке не создаётся ничего. Заявка блокируется FOR
+// UPDATE — закрыть её можно только из pending (иначе 409).
+requestsRouter.post(
+  "/:id/complete",
+  requireRole("curator", "admin"),
+  asyncHandler(async (req, res) => {
+    const requestId = Number(req.params.id);
+    if (!Number.isInteger(requestId)) return res.status(404).json({ error: "not found" });
+
+    const { work_type_id, new_work_type, comment } = req.body || {};
+
+    let responseMessage = null;
+    if (comment != null) {
+      if (typeof comment !== "string") return res.status(400).json({ error: "comment must be a string" });
+      const trimmed = comment.trim();
+      if (trimmed.length > MAX_RESPONSE_MESSAGE_LENGTH) {
+        return res
+          .status(400)
+          .json({ error: `comment must be at most ${MAX_RESPONSE_MESSAGE_LENGTH} characters` });
+      }
+      responseMessage = trimmed || null;
+    }
+
+    const hasExisting = work_type_id != null && work_type_id !== "";
+    const hasNew = new_work_type != null;
+    if (hasExisting === hasNew) {
+      return res
+        .status(400)
+        .json({ error: "Укажите либо позицию из справочника, либо данные новой позиции" });
+    }
+    if (hasNew && (typeof new_work_type !== "object" || Array.isArray(new_work_type))) {
+      return res.status(400).json({ error: "Некорректные данные новой позиции" });
+    }
+
+    const before = await loadFullRequest(requestId);
+    if (!before) return res.status(404).json({ error: "not found" });
+
+    let createdId = null;
+    let updated;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const fail = async (status, error) => {
+        await client.query("ROLLBACK");
+        return res.status(status).json({ error });
+      };
+
+      const { rows: lockRows } = await client.query(
+        `SELECT status FROM requests WHERE id = $1 FOR UPDATE`,
+        [requestId],
+      );
+      if (!lockRows[0]) return fail(404, "not found");
+      if (lockRows[0].status !== "pending") return fail(409, "Заявка уже обработана");
+
+      let workTypeId;
+      if (hasExisting) {
+        workTypeId = Number(work_type_id);
+        if (!Number.isInteger(workTypeId)) return fail(400, "work_type_id должен быть целым числом");
+        const { rows: wtRows } = await client.query(
+          `SELECT id, level, status FROM work_types WHERE id = $1`,
+          [workTypeId],
+        );
+        const wt = wtRows[0];
+        if (!wt) return fail(400, "Позиция не найдена");
+        if (wt.level !== 5) return fail(400, "Выберите позицию, а не раздел справочника");
+        if (wt.status === "archived") return fail(400, "Позиция в архиве");
+      } else {
+        const { parent_id, text, unit, price, has_price, labor_hours, gesn_code, work_composition } =
+          new_work_type;
+        const parentId = Number(parent_id);
+        if (parent_id == null || parent_id === "" || !Number.isInteger(parentId)) {
+          return fail(400, "Выберите расположение позиции");
+        }
+        if (unit == null || !String(unit).trim()) return fail(400, "Укажите единицу измерения");
+        const priceError = validatePrice(price);
+        if (priceError) return fail(400, priceError);
+
+        const { parent, error: parentError } = await loadLeafParent(client, parentId, { forUpdate: true });
+        if (parentError) return fail(parentError.status, parentError.error);
+
+        const { name, variantLabel, error: nameError } = resolveLeafName(parent, text);
+        if (nameError) return fail(400, nameError);
+
+        const { id, error: insertError } = await insertLeaf(
+          client,
+          parent,
+          { name, variant_label: variantLabel, unit, price, has_price, labor_hours, gesn_code, work_composition },
+          { nameConflictMessage: "Такая позиция уже есть в этом месте" },
+        );
+        if (insertError) return fail(insertError.status, insertError.error);
+        createdId = id;
+        workTypeId = id;
+
+        await insertAuditLog(client, {
+          entityType: "work_type",
+          entityId: id,
+          action: "create",
+          actorUserId: req.user.id,
+          actorName: req.user.full_name,
+          before: null,
+          after: await buildLeafDetail(client, id),
+        });
+      }
+
+      const { rows } = await client.query(
+        `UPDATE requests SET
+           status = 'approved',
+           work_type_id = $1,
+           response_message = $2,
+           resolved_at = now(),
+           resolved_by = $3
+         WHERE id = $4 RETURNING *`,
+        [workTypeId, responseMessage, req.user.full_name, requestId],
+      );
+      updated = rows[0];
+
+      await markRequestNotificationsRead(client, requestId);
+      await insertAuditLog(client, {
+        entityType: "request",
+        entityId: requestId,
+        action: "update",
+        actorUserId: req.user.id,
+        actorName: req.user.full_name,
+        before,
+        after: { ...updated, comments: before.comments },
+      });
+
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+    if (!updated) return; // ответ с ошибкой уже отправлен (fail)
+
+    const [result] = await withResponseFieldsList([updated]);
+    res.json(result);
+    if (createdId) scheduleEmbeddingRefresh(createdId);
+
+    const authorId = updated.submitted_by_user_id ?? (await findUserIdByName(updated.submitted_by));
+    if (authorId) {
+      void sendPushToUser(authorId, {
+        title: "Заявка выполнена",
+        body: result.work_type ? `Позиция: ${result.work_type.name}` : updated.text,
+        url: `/messages?request=${updated.id}`,
       });
     }
   }),

@@ -17,6 +17,8 @@ import {
   loadLeafParent,
   insertLeaf,
   buildLeafName,
+  resolveLeafName,
+  loadWorkTypePaths,
   embeddingTextChanged,
   scheduleEmbeddingRefresh,
 } from "./work-types-shared.js";
@@ -829,26 +831,12 @@ workTypesTreeRouter.get(
     if (!Number.isInteger(id)) {
       return res.status(400).json({ error: "id должен быть целым числом" });
     }
-    const { rows: leafRows } = await pool.query(
-      `SELECT id, name, catalog_type FROM work_types WHERE id = $1`,
-      [id],
-    );
-    const leaf = leafRows[0];
-    if (!leaf) return res.status(404).json({ error: "not found" });
-
-    const ancestors = await loadAncestorChain(id);
-
-    const sbornik = ancestors.find((a) => a.level === 1);
-    res.json({
-      catalog_type: sbornik?.catalog_type ?? leaf.catalog_type ?? null,
-      levels: ancestors.map(({ id: nodeId, level, name, gesn_code }) => ({
-        id: nodeId,
-        level,
-        name,
-        gesn_code,
-      })),
-      leaf: { id: leaf.id, name: leaf.name },
-    });
+    // Та же логика, что и путь позиции в заявках мастера (GET /api/requests) —
+    // общий хелпер loadWorkTypePaths.
+    const path = (await loadWorkTypePaths(pool, [id])).get(id);
+    if (!path) return res.status(404).json({ error: "not found" });
+    const { catalog_type, levels, leaf } = path;
+    res.json({ catalog_type, levels, leaf });
   }),
 );
 
@@ -1288,7 +1276,6 @@ workTypesTreeRouter.post(
         await client.query("ROLLBACK");
         return res.status(parentError.status).json({ error: parentError.error });
       }
-      const isGroup = parent.level === 4;
 
       const createdIds = [];
       for (let i = 0; i < items.length; i += 1) {
@@ -1308,18 +1295,10 @@ workTypesTreeRouter.post(
         const priceError = validatePrice(price);
         if (priceError) return rowError(400, priceError);
 
-        const trimmedText = text != null ? String(text).trim() : "";
-        let leafName;
-        let variantLabel = null;
-        if (isGroup) {
-          if (!trimmedText && items.length > 1) return rowError(400, "Укажите вариант");
-          variantLabel = trimmedText || null;
-          leafName = buildLeafName(parent.name, variantLabel);
-        } else {
-          if (!trimmedText) return rowError(400, "Введите название позиции");
-          leafName = trimmedText;
-        }
-        if (!leafName) return rowError(400, "Введите название позиции");
+        const { name: leafName, variantLabel, error: nameError } = resolveLeafName(parent, text, {
+          multiple: items.length > 1,
+        });
+        if (nameError) return rowError(400, nameError);
 
         const { id, error } = await insertLeaf(
           client,

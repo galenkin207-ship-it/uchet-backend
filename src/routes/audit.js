@@ -230,7 +230,9 @@ async function restoreRequest(id, snapshot) {
       // Заявка ещё в базе (правка или мягкое удаление) — откатываем поля.
       await client.query(
         `UPDATE requests SET status=$1, resolved_name=$2, resolved_unit=$3, resolved_price=$4,
-           reject_reason=$5, resolved_at=$6, rejected_at=$7, response_message=$8
+           reject_reason=$5, resolved_at=$6, rejected_at=$7, response_message=$8,
+           work_type_id=(SELECT id FROM work_types WHERE id = $10),
+           record_id=(SELECT id FROM records WHERE id = $11)
          WHERE id=$9`,
         [
           snapshot.status,
@@ -242,6 +244,10 @@ async function restoreRequest(id, snapshot) {
           snapshot.rejected_at,
           snapshot.response_message ?? null,
           id,
+          // Позиция/запись из снимка могли быть с тех пор удалены — тогда NULL
+          // (как и ON DELETE SET NULL), а не нарушение внешнего ключа.
+          snapshot.work_type_id ?? null,
+          snapshot.record_id ?? null,
         ],
       );
 
@@ -266,8 +272,10 @@ async function restoreRequest(id, snapshot) {
       // владение такой восстановленной заявкой определится по ФИО (см. requests.js).
       await client.query(
         `INSERT INTO requests (id, text, submitted_by, submitted_by_user_id, status, resolved_name, resolved_unit,
-            resolved_price, reject_reason, created_at, resolved_at, rejected_at, response_message)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+            resolved_price, reject_reason, created_at, resolved_at, rejected_at, response_message,
+            work_type_id, record_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+            (SELECT id FROM work_types WHERE id = $14), (SELECT id FROM records WHERE id = $15))`,
         [
           id,
           snapshot.text,
@@ -282,6 +290,8 @@ async function restoreRequest(id, snapshot) {
           snapshot.resolved_at,
           snapshot.rejected_at,
           snapshot.response_message ?? null,
+          snapshot.work_type_id ?? null,
+          snapshot.record_id ?? null,
         ],
       );
       await client.query(

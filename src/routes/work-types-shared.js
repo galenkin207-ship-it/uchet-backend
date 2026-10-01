@@ -160,6 +160,26 @@ export function buildLeafName(groupName, variant) {
   return group.endsWith(":") ? `${group} ${v}` : `${group}: ${v}`;
 }
 
+// Итоговое имя листа из введённого текста строки — по типу родителя:
+//   - родитель — группа (level 4): text = вариант, name = buildLeafName(группа,
+//     вариант), variant_label = вариант или NULL; если строк несколько
+//     (multiple), вариант обязателен;
+//   - родитель — контейнер level < 4: text = полное название, обязателен.
+// Возвращает { name, variantLabel } или { error }. Общая для POST /batch
+// (work-types-tree.js) и закрытия заявки новой позицией (requests.js).
+export function resolveLeafName(parent, text, { multiple = false } = {}) {
+  const trimmedText = text != null ? String(text).trim() : "";
+  if (parent.level === 4) {
+    if (!trimmedText && multiple) return { error: "Укажите вариант" };
+    const variantLabel = trimmedText || null;
+    const name = buildLeafName(parent.name, variantLabel);
+    if (!name) return { error: "Введите название позиции" };
+    return { name, variantLabel };
+  }
+  if (!trimmedText) return { error: "Введите название позиции" };
+  return { name: trimmedText, variantLabel: null };
+}
+
 // Обязательные поля листа: название, единица (NOT NULL в work_types — без неё
 // INSERT упал бы с 23502) и цена. Возвращает текст ошибки или null.
 export function validateLeafInput({ name, unit, price }) {
@@ -257,6 +277,63 @@ export async function getAncestorChain(executor, leafId) {
     [leafId],
   );
   return rows;
+}
+
+// Пути нескольких позиций одним запросом — формат GET /:id/path: предки от
+// сборника (level 1) вниз до непосредственного родителя + сама позиция.
+// Синтетический корень source='legacy_root' в путь не входит, пропущенные
+// уровни просто отсутствуют, цены нет. catalog_type — у level-1 предка, а если
+// его нет (позиция под legacy_root) — самой позиции. UNION (а не UNION ALL) —
+// страховка от зацикленного parent_id. Дополнительно — unit и status позиции
+// (для заявок мастера: в запись нужна единица, архивная позиция недоступна).
+// Возвращает Map(id → путь); несуществующих id в ней нет.
+export async function loadWorkTypePaths(executor, ids) {
+  const list = [...new Set((ids || []).map(Number).filter(Number.isInteger))];
+  const result = new Map();
+  if (!list.length) return result;
+
+  const { rows: leaves } = await executor.query(
+    `SELECT id, name, unit, price, status, level, catalog_type FROM work_types WHERE id = ANY($1)`,
+    [list],
+  );
+  if (!leaves.length) return result;
+
+  const { rows: ancestors } = await executor.query(
+    `WITH RECURSIVE anc AS (
+       SELECT wt.id AS leaf_id, p.id, p.parent_id, p.level, p.name, p.gesn_code, p.catalog_type, p.source
+         FROM work_types wt
+         JOIN work_types p ON p.id = wt.parent_id
+        WHERE wt.id = ANY($1)
+       UNION
+       SELECT anc.leaf_id, p.id, p.parent_id, p.level, p.name, p.gesn_code, p.catalog_type, p.source
+         FROM anc
+         JOIN work_types p ON p.id = anc.parent_id
+     )
+     SELECT leaf_id, id, level, name, gesn_code, catalog_type FROM anc
+      WHERE source IS DISTINCT FROM 'legacy_root'
+      ORDER BY leaf_id, level ASC`,
+    [leaves.map((l) => l.id)],
+  );
+  const ancestorsByLeaf = new Map();
+  for (const a of ancestors) {
+    if (!ancestorsByLeaf.has(a.leaf_id)) ancestorsByLeaf.set(a.leaf_id, []);
+    ancestorsByLeaf.get(a.leaf_id).push(a);
+  }
+
+  for (const leaf of leaves) {
+    const chain = ancestorsByLeaf.get(leaf.id) || [];
+    const sbornik = chain.find((a) => a.level === 1);
+    result.set(leaf.id, {
+      catalog_type: sbornik?.catalog_type ?? leaf.catalog_type ?? null,
+      levels: chain.map(({ id, level, name, gesn_code }) => ({ id, level, name, gesn_code })),
+      leaf: { id: leaf.id, name: leaf.name },
+      unit: leaf.unit,
+      price: leaf.price,
+      status: leaf.status,
+      level: leaf.level,
+    });
+  }
+  return result;
 }
 
 const LEAF_DETAIL_COLUMNS = `
