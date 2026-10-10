@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { pool } from "../db.js";
-import { getEmbedding } from "../openai.js";
+import { getQueryEmbedding } from "../openai.js";
 import { rerankCandidates, CONFIDENCE_LEVELS } from "../deepseek.js";
 import { requireAuth, requireRole, isAdminLike } from "../auth.js";
 import { asyncHandler } from "../async-handler.js";
@@ -497,6 +497,91 @@ function extractKeywordStems(query) {
   return { concepts, stems: usedStems, synonyms };
 }
 
+// Текстовый поиск листьев (логика GET /search, см. комментарий ниже).
+// Возвращает отсортированные items (с variant_label) или [] для слишком
+// короткого запроса. Используется в GET /search и как запасной вариант
+// /search-smart без mode=ai, когда эмбеддинг запроса не удался.
+async function textSearch(rawQuery, limit) {
+  const { tokens, codeToken } = parseSearchQuery(rawQuery);
+  if (!rawQuery || normalize(rawQuery).length < 2 || tokens.length === 0) {
+    return [];
+  }
+  const codeOnly = codeToken != null && tokens.length === 1;
+
+  const params = tokens.map((t) => `%${t}%`);
+  let codeTierSelect = "2 AS code_tier";
+  let orderBy = "wt.id";
+  let codeClauseFor = null;
+  if (codeToken) {
+    params.push(codeToken, `${codeToken}%`);
+    const exactParam = `$${params.length - 1}`;
+    const prefixParam = `$${params.length}`;
+    codeTierSelect = `CASE WHEN wt.gesn_code ILIKE ${exactParam} THEN 0
+                           WHEN wt.gesn_code ILIKE ${prefixParam} THEN 1
+                           ELSE 2 END AS code_tier`;
+    orderBy = "code_tier, CASE WHEN wt.gesn_code ILIKE " + prefixParam +
+      " THEN wt.gesn_code END, wt.id";
+    codeClauseFor = (i) =>
+      tokens[i] === codeToken
+        ? `(wt.name ILIKE $${i + 1} OR wt.gesn_code ILIKE ${prefixParam})`
+        : null;
+  }
+  const ilikeClauses = tokens
+    .map((_, i) => (codeClauseFor && codeClauseFor(i)) || `wt.name ILIKE $${i + 1}`)
+    .join(" AND ");
+
+  // 4 уровня предков фиксированы деревом (сборник → раздел → таблица →
+  // группа) — прямые JOIN проще и понятнее, чем рекурсивный CTE, для
+  // фиксированной глубины.
+  const { rows } = await pool.query(
+    `SELECT wt.id, wt.name, wt.level, wt.parent_id, wt.unit, wt.price, wt.has_price,
+            wt.gesn_code, wt.catalog_type, wt.is_step_item, wt.step_unit_label,
+            wt.work_composition, wt.labor_hours, wt.source, wt.variant_label,
+            EXISTS (
+              SELECT 1 FROM work_types s
+               WHERE s.step_base_work_type_id = wt.id AND s.is_counter_step = true
+                 AND s.status <> 'archived'
+            ) AS has_counter_steps,
+            p1.name AS breadcrumb_1, p2.name AS breadcrumb_2,
+            p3.name AS breadcrumb_3, p4.name AS breadcrumb_4,
+            ${codeTierSelect}
+       FROM work_types wt
+       LEFT JOIN work_types p4 ON p4.id = wt.parent_id
+       LEFT JOIN work_types p3 ON p3.id = p4.parent_id
+       LEFT JOIN work_types p2 ON p2.id = p3.parent_id
+       LEFT JOIN work_types p1 ON p1.id = p2.parent_id
+      WHERE wt.level = 5 AND wt.status <> 'archived' AND wt.is_step_item = false AND ${ilikeClauses}
+      ORDER BY ${orderBy}
+      LIMIT 500`,
+    params,
+  );
+
+  // Array.prototype.sort стабилен: в режиме "только код" порядок точных и
+  // префиксных совпадений (gesn_code, id) остаётся таким, как отдал SQL.
+  return rows
+    .map((row) => {
+      const {
+        breadcrumb_1: b1,
+        breadcrumb_2: b2,
+        breadcrumb_3: b3,
+        breadcrumb_4: b4,
+        code_tier: codeTier,
+        ...item
+      } = row;
+      let score = matchScore(row.name, tokens);
+      if (!codeOnly && codeTier === 0) score -= EXACT_CODE_SCORE_BONUS;
+      return {
+        ...item,
+        breadcrumb: dedupeBreadcrumb([b1, b2, b3, b4].filter((x) => x != null)),
+        tier: codeOnly ? codeTier : 2,
+        score,
+      };
+    })
+    .sort((a, b) => a.tier - b.tier || (a.tier === 2 ? a.score - b.score : 0))
+    .slice(0, limit)
+    .map(({ score, tier, ...item }) => item);
+}
+
 // GET /search?q=<строка>&limit=<число, по умолчанию 50, максимум 200>
 // Двухэтапно: SQL сужает кандидатов до level=5 позиций, содержащих все
 // токены (верхняя защитная граница LIMIT 500, не финальная выдача), затем
@@ -514,91 +599,13 @@ workTypesTreeRouter.get(
   "/search",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const rawQuery = req.query.q;
-    const { tokens, codeToken } = parseSearchQuery(rawQuery);
-    if (!rawQuery || normalize(rawQuery).length < 2 || tokens.length === 0) {
-      return res.json({ items: [] });
-    }
-    const codeOnly = codeToken != null && tokens.length === 1;
-
     let limit = Number(req.query.limit);
     if (!Number.isFinite(limit) || limit <= 0) limit = 50;
     limit = Math.min(Math.trunc(limit), 200);
 
-    const params = tokens.map((t) => `%${t}%`);
-    let codeTierSelect = "2 AS code_tier";
-    let orderBy = "wt.id";
-    let codeClauseFor = null;
-    if (codeToken) {
-      params.push(codeToken, `${codeToken}%`);
-      const exactParam = `$${params.length - 1}`;
-      const prefixParam = `$${params.length}`;
-      codeTierSelect = `CASE WHEN wt.gesn_code ILIKE ${exactParam} THEN 0
-                             WHEN wt.gesn_code ILIKE ${prefixParam} THEN 1
-                             ELSE 2 END AS code_tier`;
-      orderBy = "code_tier, CASE WHEN wt.gesn_code ILIKE " + prefixParam +
-        " THEN wt.gesn_code END, wt.id";
-      codeClauseFor = (i) =>
-        tokens[i] === codeToken
-          ? `(wt.name ILIKE $${i + 1} OR wt.gesn_code ILIKE ${prefixParam})`
-          : null;
-    }
-    const ilikeClauses = tokens
-      .map((_, i) => (codeClauseFor && codeClauseFor(i)) || `wt.name ILIKE $${i + 1}`)
-      .join(" AND ");
-
-    // 4 уровня предков фиксированы деревом (сборник → раздел → таблица →
-    // группа) — прямые JOIN проще и понятнее, чем рекурсивный CTE, для
-    // фиксированной глубины.
-    const { rows } = await pool.query(
-      `SELECT wt.id, wt.name, wt.level, wt.parent_id, wt.unit, wt.price, wt.has_price,
-              wt.gesn_code, wt.catalog_type, wt.is_step_item, wt.step_unit_label,
-              wt.work_composition, wt.labor_hours, wt.source,
-              EXISTS (
-                SELECT 1 FROM work_types s
-                 WHERE s.step_base_work_type_id = wt.id AND s.is_counter_step = true
-                   AND s.status <> 'archived'
-              ) AS has_counter_steps,
-              p1.name AS breadcrumb_1, p2.name AS breadcrumb_2,
-              p3.name AS breadcrumb_3, p4.name AS breadcrumb_4,
-              ${codeTierSelect}
-         FROM work_types wt
-         LEFT JOIN work_types p4 ON p4.id = wt.parent_id
-         LEFT JOIN work_types p3 ON p3.id = p4.parent_id
-         LEFT JOIN work_types p2 ON p2.id = p3.parent_id
-         LEFT JOIN work_types p1 ON p1.id = p2.parent_id
-        WHERE wt.level = 5 AND wt.status <> 'archived' AND wt.is_step_item = false AND ${ilikeClauses}
-        ORDER BY ${orderBy}
-        LIMIT 500`,
-      params,
-    );
-
-    // Array.prototype.sort стабилен: в режиме "только код" порядок точных и
-    // префиксных совпадений (gesn_code, id) остаётся таким, как отдал SQL.
-    const items = rows
-      .map((row) => {
-        const {
-          breadcrumb_1: b1,
-          breadcrumb_2: b2,
-          breadcrumb_3: b3,
-          breadcrumb_4: b4,
-          code_tier: codeTier,
-          ...item
-        } = row;
-        let score = matchScore(row.name, tokens);
-        if (!codeOnly && codeTier === 0) score -= EXACT_CODE_SCORE_BONUS;
-        return {
-          ...item,
-          breadcrumb: dedupeBreadcrumb([b1, b2, b3, b4].filter((x) => x != null)),
-          tier: codeOnly ? codeTier : 2,
-          score,
-        };
-      })
-      .sort((a, b) => a.tier - b.tier || (a.tier === 2 ? a.score - b.score : 0))
-      .slice(0, limit)
-      .map(({ score, tier, ...item }) => item);
-
-    res.json({ items });
+    const items = await textSearch(req.query.q, limit);
+    // variant_label /search исторически не отдаёт — ответ не меняем.
+    res.json({ items: items.map(({ variant_label: _variantLabel, ...item }) => item) });
   }),
 );
 
@@ -703,7 +710,9 @@ async function buildHybridCandidates(query, vectorLiteral, vectorCandidates) {
 // confidence: null, reranked: false; но при mode=ai ошибка эмбеддинга запроса
 // или реранка (любая, включая отсутствие ключа) — 503 {error: "ai_unavailable"}:
 // пользователь явно просил ИИ-поиск, молча подменять его результатами ступени A
-// нельзя. Без mode=ai ошибка эмбеддинга — 500 (общий обработчик).
+// нельзя. Без mode=ai при ошибке эмбеддинга — результаты текстового поиска
+// (логика GET /search) в той же форме (similarity: 0, confidence: null,
+// reranked: false) плюс degraded: true.
 workTypesTreeRouter.get(
   "/search-smart",
   requireAuth,
@@ -722,13 +731,23 @@ workTypesTreeRouter.get(
     const aiMode = req.query.mode === "ai";
     let queryEmbedding;
     try {
-      queryEmbedding = await getEmbedding(query);
+      queryEmbedding = await getQueryEmbedding(query);
     } catch (err) {
-      // mode=ai — как при сбое реранка: 503 ai_unavailable. Без mode=ai —
-      // по-прежнему в общий обработчик ошибок (500).
-      if (!aiMode) throw err;
-      console.error(`[search-smart] эмбеддинг запроса не удался в mode=ai (${err?.status ?? err?.cause?.code ?? err?.name}) — отвечаем 503`);
-      return res.status(503).json(AI_UNAVAILABLE);
+      const reason = err?.status ?? err?.cause?.code ?? err?.name;
+      // mode=ai — как при сбое реранка: 503 ai_unavailable.
+      if (aiMode) {
+        console.error(`[search-smart] эмбеддинг запроса не удался в mode=ai (${reason}) — отвечаем 503`);
+        return res.status(503).json(AI_UNAVAILABLE);
+      }
+      // Без mode=ai — обычный текстовый поиск (логика GET /search) в форме
+      // ответа /search-smart, с пометкой degraded: true.
+      console.error(`[search-smart] эмбеддинг запроса не удался (${reason}) — отдаём текстовый поиск (degraded)`);
+      const items = await textSearch(query, limit);
+      return res.json({
+        items: items.map((item) => ({ ...item, similarity: 0, confidence: null })),
+        reranked: false,
+        degraded: true,
+      });
     }
     const vectorLiteral = JSON.stringify(queryEmbedding);
 

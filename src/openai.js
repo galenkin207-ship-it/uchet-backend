@@ -4,6 +4,10 @@ import { createAiFetch, attemptStatus } from "./ai-fetch.js";
 
 export const EMBEDDING_MODEL = "text-embedding-3-small";
 const LOG_PREFIX = "[openai embed]";
+// Эмбеддинг запроса пользователя (/search-smart): без повторов SDK и с
+// коротким таймаутом — пользователь ждёт ответа. Фоновый пересчёт и
+// scripts/index-embeddings.js — с настройками SDK по умолчанию (повторы есть).
+const QUERY_EMBEDDING_TIMEOUT_MS = 10_000;
 
 if (!process.env.OPENAI_API_KEY) {
   console.error(
@@ -62,15 +66,23 @@ export async function loggedCall(via, fn, { now = Date.now, log = console.log } 
   }
 }
 
-// input — строка или массив строк (батч). Возвращает ответ embeddings.create.
-export async function createEmbeddings(input) {
+// input — строка или массив строк (батч); requestOptions — опции запроса SDK
+// (maxRetries, timeout). Возвращает ответ embeddings.create.
+export async function createEmbeddings(input, requestOptions) {
   const { client, via } = await getClient();
   return loggedCall(via, () =>
-    client.embeddings.create({ model: EMBEDDING_MODEL, input }).withResponse()
+    client.embeddings.create({ model: EMBEDDING_MODEL, input }, requestOptions).withResponse()
   );
 }
 
+// Фоновый пересчёт эмбеддингов позиций — с повторами SDK.
 export async function getEmbedding(text) {
   const response = await createEmbeddings(text);
+  return response.data[0].embedding;
+}
+
+// Эмбеддинг поискового запроса пользователя — одна попытка, таймаут 10 с.
+export async function getQueryEmbedding(text) {
+  const response = await createEmbeddings(text, { maxRetries: 0, timeout: QUERY_EMBEDDING_TIMEOUT_MS });
   return response.data[0].embedding;
 }

@@ -4,9 +4,12 @@
 import assert from "node:assert/strict";
 import net from "node:net";
 
-// Ключ-заглушка до импорта: SDK требует apiKey при создании клиента.
+// Ключ-заглушка до импорта: SDK требует apiKey при создании клиента. AI_PROXY
+// пустой — модульный клиент src/openai.js берёт глобальный fetch, который
+// подменяется ниже (dotenv существующие переменные не перезаписывает).
 process.env.OPENAI_API_KEY ||= "sk-test";
-const { buildClient, loggedCall } = await import("../src/openai.js");
+process.env.AI_PROXY = "";
+const { buildClient, loggedCall, getEmbedding, getQueryEmbedding } = await import("../src/openai.js");
 const { isConnectError } = await import("../src/ai-fetch.js");
 
 const fakeClock = () => {
@@ -92,6 +95,27 @@ const cases = {
     assert.deepEqual(directCalls, []);
     assert.equal(logs.length, 1);
     assert.match(logs[0], /^\[openai embed\] via=proxy status=ECONNREFUSED ms=\d+$/);
+  },
+
+  "эмбеддинг запроса — одна попытка, фоновый — с повторами SDK": async () => {
+    const realFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      throw new TypeError("fetch failed");
+    };
+    const realLog = console.log;
+    console.log = () => {};
+    try {
+      await assert.rejects(getQueryEmbedding("запрос"));
+      assert.equal(calls, 1, "getQueryEmbedding: без повторов");
+      calls = 0;
+      await assert.rejects(getEmbedding("позиция"));
+      assert.equal(calls, 3, "getEmbedding: 1 + 2 повтора SDK по умолчанию");
+    } finally {
+      globalThis.fetch = realFetch;
+      console.log = realLog;
+    }
   },
 };
 
