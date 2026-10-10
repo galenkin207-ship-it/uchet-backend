@@ -697,7 +697,9 @@ async function buildHybridCandidates(query, vectorLiteral, vectorCandidates) {
 // реранкаются через DeepSeek
 // (src/deepseek.js) — items получают confidence ("exact"/"likely"/"similar"),
 // в ответе reranked: true. Без реранка или при его ошибке — порядок ступени A,
-// confidence: null, reranked: false.
+// confidence: null, reranked: false; но при mode=ai ошибка реранка (любая,
+// включая отсутствие ключа) — 503 {error: "ai_unavailable"}: пользователь явно
+// просил ИИ-поиск, молча подменять его результатами ступени A нельзя.
 workTypesTreeRouter.get(
   "/search-smart",
   requireAuth,
@@ -740,8 +742,9 @@ workTypesTreeRouter.get(
         vectorLiteral,
         items.slice(0, SEARCH_SMART_RERANK_CANDIDATES)
       );
-      const confidence = await rerankCandidates(query, candidates);
-      if (confidence) {
+      const rerank = await rerankCandidates(query, candidates);
+      if (rerank.ok) {
+        const { confidence } = rerank;
         // exact → likely → similar, внутри группы — по similarity ступени A
         // (sort стабильный; у текстовых кандидатов без эмбеддинга similarity 0).
         // keywordMatch — только для промпта, клиенту не отдаём.
@@ -755,6 +758,13 @@ workTypesTreeRouter.get(
           .filter((item) => !candidateIds.has(item.id))
           .map((item) => ({ ...item, confidence: null }));
         return res.json({ items: [...reranked, ...rest].slice(0, limit), reranked: true });
+      }
+      if (aiMode) {
+        console.error("[search-smart] реранк не удался в mode=ai — отвечаем 503");
+        return res.status(503).json({
+          error: "ai_unavailable",
+          message: "ИИ временно недоступен, повторите попытку",
+        });
       }
       console.error(
         `[search-smart] реранк не удался (top similarity=${items[0].similarity.toFixed(3)}), ` +
