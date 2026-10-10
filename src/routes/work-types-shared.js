@@ -5,6 +5,7 @@
 // друг друга.
 
 import { pool } from "../db.js";
+import { errorName, attemptStatus } from "../ai-fetch.js";
 
 export function validatePrice(price) {
   if (price == null) return null;
@@ -421,15 +422,16 @@ async function refreshEmbeddings(ids) {
     [ids],
   );
   if (!rows.length) return;
-  // Ленивый импорт: new OpenAI() в openai.js бросает без OPENAI_API_KEY, а этот
-  // модуль импортируют и офлайн-скрипты (scripts/test-build-leaf-name.js).
+  // Ленивый импорт: этот модуль импортируют и офлайн-скрипты
+  // (scripts/test-build-leaf-name.js) — им openai/undici не нужны.
   const { getEmbedding } = await import("../openai.js");
   for (const row of rows) {
     try {
       const vector = await getEmbedding(buildEmbeddingText(row));
       await pool.query(`UPDATE work_types SET embedding = $1 WHERE id = $2`, [JSON.stringify(vector), row.id]);
     } catch (err) {
-      console.error(`Не удалось пересчитать эмбеддинг work_types id=${row.id} gesn_code=${row.gesn_code ?? "-"}:`, err.message);
+      // Только имя и код ошибки: текст ошибок сети/SDK может содержать URL.
+      console.error(`Не удалось пересчитать эмбеддинг work_types id=${row.id} gesn_code=${row.gesn_code ?? "-"}: ${errorName(err)} ${attemptStatus(err)}`);
     }
   }
 }

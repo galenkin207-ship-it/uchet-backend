@@ -41,6 +41,9 @@ const SEARCH_SMART_RERANK_CANDIDATES = 20;
 // позиций, найденных текстовым совпадением по специфическим словам запроса.
 const SEARCH_SMART_KEYWORD_CANDIDATES = 10;
 const SEARCH_SMART_MAX_KEYWORDS = 6;
+// Ответ /search-smart?mode=ai, когда эмбеддинг запроса (OpenAI) или реранк
+// (DeepSeek) не удался.
+const AI_UNAVAILABLE = { error: "ai_unavailable", message: "ИИ временно недоступен, повторите попытку" };
 
 // Основы частотных «общих» слов (действия, служебные слова каталога), которые
 // есть в названиях множества позиций и не сужают поиск. Слово запроса,
@@ -697,9 +700,10 @@ async function buildHybridCandidates(query, vectorLiteral, vectorCandidates) {
 // реранкаются через DeepSeek
 // (src/deepseek.js) — items получают confidence ("exact"/"likely"/"similar"),
 // в ответе reranked: true. Без реранка или при его ошибке — порядок ступени A,
-// confidence: null, reranked: false; но при mode=ai ошибка реранка (любая,
-// включая отсутствие ключа) — 503 {error: "ai_unavailable"}: пользователь явно
-// просил ИИ-поиск, молча подменять его результатами ступени A нельзя.
+// confidence: null, reranked: false; но при mode=ai ошибка эмбеддинга запроса
+// или реранка (любая, включая отсутствие ключа) — 503 {error: "ai_unavailable"}:
+// пользователь явно просил ИИ-поиск, молча подменять его результатами ступени A
+// нельзя. Без mode=ai ошибка эмбеддинга — 500 (общий обработчик).
 workTypesTreeRouter.get(
   "/search-smart",
   requireAuth,
@@ -714,7 +718,18 @@ workTypesTreeRouter.get(
     limit = Math.min(Math.trunc(limit), 50);
 
     const query = String(rawQuery).trim();
-    const queryEmbedding = await getEmbedding(query);
+    // mode=ai — кнопка «Поиск ИИ» на фронте: реранк всегда, сбой ИИ — 503.
+    const aiMode = req.query.mode === "ai";
+    let queryEmbedding;
+    try {
+      queryEmbedding = await getEmbedding(query);
+    } catch (err) {
+      // mode=ai — как при сбое реранка: 503 ai_unavailable. Без mode=ai —
+      // по-прежнему в общий обработчик ошибок (500).
+      if (!aiMode) throw err;
+      console.error(`[search-smart] эмбеддинг запроса не удался в mode=ai (${err?.status ?? err?.cause?.code ?? err?.name}) — отвечаем 503`);
+      return res.status(503).json(AI_UNAVAILABLE);
+    }
     const vectorLiteral = JSON.stringify(queryEmbedding);
 
     const { rows } = await pool.query(
@@ -731,8 +746,7 @@ workTypesTreeRouter.get(
     const items = rows.map(toSearchSmartItem);
 
     // Ступень B: реранк через DeepSeek, если ступень A не уверена либо
-    // явно запрошен ИИ-поиск (mode=ai — кнопка «Поиск ИИ» на фронте).
-    const aiMode = req.query.mode === "ai";
+    // явно запрошен ИИ-поиск (mode=ai).
     if (
       items.length > 0 &&
       (aiMode || items[0].similarity < SEARCH_SMART_RERANK_THRESHOLD)
@@ -761,10 +775,7 @@ workTypesTreeRouter.get(
       }
       if (aiMode) {
         console.error("[search-smart] реранк не удался в mode=ai — отвечаем 503");
-        return res.status(503).json({
-          error: "ai_unavailable",
-          message: "ИИ временно недоступен, повторите попытку",
-        });
+        return res.status(503).json(AI_UNAVAILABLE);
       }
       console.error(
         `[search-smart] реранк не удался (top similarity=${items[0].similarity.toFixed(3)}), ` +

@@ -2,7 +2,8 @@
 //   node scripts/test-deepseek-path.js
 // Попытки — фейковые функции, время — подменённые «часы».
 import assert from "node:assert/strict";
-import { createPathRunner, ConnectPhaseError, PROXY_DOWN_MS } from "../src/deepseek.js";
+import { createPathRunner, PROXY_DOWN_MS } from "../src/deepseek.js";
+import { ConnectPhaseError } from "../src/ai-fetch.js";
 
 // Ошибки в том виде, в каком их отдаёт SDK openai.
 const connectError = (code) => Object.assign(new Error("Connection error."), { cause: new ConnectPhaseError(code) });

@@ -1,12 +1,13 @@
 import "dotenv/config";
 import { pool } from "../src/db.js";
-import OpenAI from "openai";
+// Тот же клиент, что у сервиса: при заданном AI_PROXY запросы к OpenAI идут
+// через прокси (src/openai.js). .env читается из текущей директории — запускать
+// из корня бэкенда, как и сервис.
+import { createEmbeddings } from "../src/openai.js";
+import { errorName, attemptStatus } from "../src/ai-fetch.js";
 
 const APPLY = process.argv.includes("--apply");
 const BATCH_SIZE = 100;
-const MODEL = "text-embedding-3-small";
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function buildText(row) {
   const parts = [row.name, row.variant_label, row.work_composition].filter(Boolean);
@@ -54,10 +55,7 @@ async function main() {
     const texts = batch.map(buildText);
 
     try {
-      const response = await openai.embeddings.create({
-        model: MODEL,
-        input: texts,
-      });
+      const response = await createEmbeddings(texts);
 
       for (let j = 0; j < batch.length; j++) {
         const vector = response.data[j].embedding;
@@ -71,7 +69,7 @@ async function main() {
       console.log(`Обработано: ${processed}/${rows.length}`);
     } catch (err) {
       failed += batch.length;
-      console.error(`Ошибка на батче ${i}-${i + batch.length}:`, err.message);
+      console.error(`Ошибка на батче ${i}-${i + batch.length}: ${errorName(err)} ${attemptStatus(err)}`);
     }
   }
 
