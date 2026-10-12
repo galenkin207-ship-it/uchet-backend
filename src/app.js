@@ -18,6 +18,7 @@ import { pushRouter } from "./routes/push.js";
 import { notificationReadsRouter } from "./routes/notification-reads.js";
 import { notificationHidesRouter } from "./routes/notification-hides.js";
 import { auditRouter } from "./routes/audit.js";
+import { objectReportPhotosRouter, objectPhotosRouter } from "./routes/object-photos.js";
 
 export const app = express();
 
@@ -49,6 +50,8 @@ app.get("/api/health", async (_req, res) => {
 
 app.use("/api", authRouter);
 app.use("/api/objects", objectsRouter);
+app.use("/api/objects", objectReportPhotosRouter);
+app.use("/api/object-photos", objectPhotosRouter);
 app.use("/api/employees", employeesRouter);
 app.use("/api/units", unitsRouter);
 app.use("/api/work-types", workTypesRouter);

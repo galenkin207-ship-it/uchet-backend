@@ -4,6 +4,15 @@ import { requireAuth, requireRole } from "../auth.js";
 import { insertAuditLog } from "../audit.js";
 import { asyncHandler } from "../async-handler.js";
 import { loadRecordsByIds } from "./records.js";
+import { deleteByPrefix } from "../s3.js";
+import {
+  objectPhotoSourceCte,
+  recordFilterSql,
+  TODAY_START,
+  TODAY_END,
+  moscowToday,
+  isIsoDate,
+} from "../object-photo-source.js";
 import {
   validatePrice,
   cascadeWorkTypeUpdate,
@@ -43,6 +52,9 @@ function makeDirectoryRouter({
   // afterResponse(before, after) — необязательный фоновый хук после ответа
   // на PUT (например, пересчёт эмбеддинга вида работ); не ждём его.
   afterResponse,
+  // afterDelete(row) — необязательный фоновый хук после успешного DELETE
+  // (например, очистка файлов объекта в S3); не ждём его.
+  afterDelete,
   // work_types нужен свой POST "/" (каскадные поля дерева, роли admin+curator
   // вместо только admin) — при customCreate=true фабрика не регистрирует
   // здесь общий POST, вызывающий код сам вешает его на тот же router.
@@ -207,6 +219,7 @@ function makeDirectoryRouter({
         });
       }
       res.json({ deleted: rows[0].id });
+      if (afterDelete) afterDelete(rows[0]);
     }),
   );
 
@@ -222,6 +235,18 @@ export const objectsRouter = makeDirectoryRouter({
   // фильтрах, а не в конец.
   orderBy: "lower(name)",
   entityType: "object",
+  // Строки object_photos удаляет ON DELETE CASCADE (миграция 033), файлы
+  // фото-отчётов — здесь, best-effort. Префикс строго "object-photos/<id>/"
+  // с закрывающим слешем (иначе для id=1 зацепило бы и 12, 13...), S3_PREFIX
+  // добавляет buildKey внутри deleteByPrefix. Ключи записей "<recordId>/" и
+  // корзина "trash/" под этот префикс не попадают.
+  afterDelete: (row) => {
+    if (!Number.isInteger(row.id)) return;
+    const prefix = `object-photos/${row.id}/`;
+    deleteByPrefix(prefix)
+      .then(() => console.log(`Удалены файлы фото-отчётов объекта ${row.id} (${prefix})`))
+      .catch((err) => console.error(`Не удалось удалить файлы фото-отчётов объекта ${row.id}:`, err));
+  },
 });
 
 // Завершение объекта: данные (записи, заявки, комментарии) никуда не деваются,
@@ -394,11 +419,51 @@ objectsRouter.get(
   }),
 );
 
+// Без include=reports ответ ровно прежний (фото завершённых записей). С
+// include=reports — единый источник (object-photo-source.js): те же фото
+// записей с source:'record' плюс фото-отчёты по объекту (source:'report');
+// from/to — по дате (records.date / object_photos.photo_date).
 objectsRouter.get(
   "/:id/photos",
   requireAuth,
   asyncHandler(async (req, res) => {
     const { from, to } = req.query;
+    if (req.query.include === "reports") {
+      if ((from && !isIsoDate(from)) || (to && !isIsoDate(to))) {
+        return res.status(400).json({ error: "from/to must be YYYY-MM-DD" });
+      }
+      if (!/^\d+$/.test(req.params.id)) return res.json({ photos: [] });
+      const params = [req.params.id];
+      if (from) params.push(from);
+      if (to) params.push(to);
+      const { rows } = await pool.query(
+        `WITH ${objectPhotoSourceCte({
+          objectParam: "$1",
+          fromParam: from ? "$2" : null,
+          toParam: to ? `$${params.length}` : null,
+          doneOnly: true,
+        })}
+         SELECT s.*, u.full_name AS author_name
+           FROM object_photo_source s LEFT JOIN users u ON u.id = s.user_id
+          ORDER BY s.photo_date DESC, s.source, s.source_id DESC, s.sort_order`,
+        params,
+      );
+      const photos = rows.map((p) =>
+        p.source === "record"
+          ? { source: "record", record_id: p.source_id, date: p.photo_date, file_path: p.file_path }
+          : {
+              source: "report",
+              id: p.source_id,
+              date: p.photo_date,
+              file_path: p.file_path,
+              comment: p.comment,
+              user_id: p.user_id,
+              author_name: p.author_name,
+              uploaded_at: p.uploaded_at,
+            },
+      );
+      return res.json({ photos });
+    }
     const records = await loadDoneRecordsForObject(req.params.id, from || null, to || null);
     const photos = [];
     for (const r of records) {
@@ -412,50 +477,30 @@ objectsRouter.get(
 
 // ---- Активность объектов за сегодня (только admin) ----
 //
-// «Сегодня» — текущие сутки по Москве, а не по таймзоне сервера/сессии БД.
-// Границы — выражения от now() (stable), поэтому планировщик использует
-// индексы по created_at (см. миграцию 032). Сравнение timestamptz-границ
-// корректно и если records.created_at — timestamp без зоны (он приводится
-// по TimeZone сессии, в которой и был записан через DEFAULT now()).
-const MSK_DAY = "date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')";
-const TODAY_START = `(${MSK_DAY} AT TIME ZONE 'Europe/Moscow')`;
-const TODAY_END = `((${MSK_DAY} + interval '1 day') AT TIME ZONE 'Europe/Moscow')`;
-
-// CTE today_activity — по строке на каждое «событие» сегодняшнего дня:
-// создание записи (file_path IS NULL) или загрузка фото. Время загрузки фото —
-// record_photos.created_at (миграция 032); у фото, загруженных до миграции,
-// его нет, и для них берётся created_at самой записи. Поле «дата работ»
-// (records.date) не учитывается вовсе. Черновики видны только автору — как в
-// GET /api/records, иначе админ увидел бы запись, карточку и фото которой
-// существующие эндпоинты ему не отдадут (canView в records.js).
-// Записи без object_id (старые, только object_name_raw) в объектную
-// активность не попадают — так же, как в work-summary/photos выше.
+// CTE today_activity — по строке на каждое «событие» сегодняшних суток по
+// Москве (границы — TODAY_START/TODAY_END в object-photo-source.js):
+//   kind = 'record' — создана запись (по created_at; «дата работ» records.date
+//                     не учитывается вовсе);
+//   kind = 'photo'  — загружено фото записи;
+//   kind = 'report' — загружен фото-отчёт по объекту (record_id IS NULL).
+// Фото берутся из единого источника object_photo_source. Черновики видны
+// только автору — как в GET /api/records, иначе админ увидел бы запись,
+// карточку и фото которой существующие эндпоинты ему не отдадут (canView в
+// records.js). Записи без object_id в объектную активность не попадают.
 function todayActivityCte(userParam, objectParam) {
-  const recordFilter = [
-    "r.object_id IS NOT NULL",
-    `(r.status <> 'draft' OR r.created_by_user_id = ${userParam})`,
-    ...(objectParam ? [`r.object_id = ${objectParam}`] : []),
-  ].join(" AND ");
-  return `today_activity AS (
-      SELECT r.id AS record_id, r.object_id, r.created_at::timestamptz AS activity_at,
+  return `${objectPhotoSourceCte({ userParam, objectParam, uploadedToday: true })},
+    today_activity AS (
+      SELECT 'record'::text AS kind, r.id AS record_id, r.object_id, r.created_at::timestamptz AS activity_at,
              NULL::text AS file_path, NULL::int AS sort_order
         FROM records r
-       WHERE ${recordFilter} AND r.created_at >= ${TODAY_START} AND r.created_at < ${TODAY_END}
-      UNION ALL
-      SELECT r.id, r.object_id, p.created_at, p.file_path, p.sort_order
-        FROM record_photos p JOIN records r ON r.id = p.record_id
-       WHERE ${recordFilter} AND p.created_at >= ${TODAY_START} AND p.created_at < ${TODAY_END}
-      UNION ALL
-      SELECT r.id, r.object_id, r.created_at::timestamptz, p.file_path, p.sort_order
-        FROM record_photos p JOIN records r ON r.id = p.record_id
-       WHERE ${recordFilter} AND p.created_at IS NULL
+       WHERE ${recordFilterSql({ userParam, objectParam })}
          AND r.created_at >= ${TODAY_START} AND r.created_at < ${TODAY_END}
+      UNION ALL
+      SELECT CASE s.source WHEN 'record' THEN 'photo' ELSE 'report' END,
+             CASE s.source WHEN 'record' THEN s.source_id END,
+             s.object_id, s.uploaded_at, s.file_path, s.sort_order
+        FROM object_photo_source s
     )`;
-}
-
-// Сегодняшняя дата по Москве в виде YYYY-MM-DD — только для ответа клиенту.
-function moscowToday() {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Moscow" }).format(new Date());
 }
 
 objectsRouter.get(
@@ -465,8 +510,9 @@ objectsRouter.get(
     const { rows } = await pool.query(
       `WITH ${todayActivityCte("$1", null)}
        SELECT o.id, o.name, o.address, o.status,
-              COUNT(*) FILTER (WHERE a.file_path IS NULL)::int AS records_count_today,
-              COUNT(*) FILTER (WHERE a.file_path IS NOT NULL)::int AS photos_count_today,
+              COUNT(*) FILTER (WHERE a.kind = 'record')::int AS records_count_today,
+              COUNT(*) FILTER (WHERE a.kind = 'photo')::int AS photos_count_today,
+              COUNT(*) FILTER (WHERE a.kind = 'report')::int AS report_photos_today,
               MAX(a.activity_at) AS last_activity_at
          FROM today_activity a JOIN objects o ON o.id = a.object_id
         GROUP BY o.id
@@ -491,13 +537,23 @@ objectsRouter.get(
     const { rows: activity } = await pool.query(
       `WITH ${todayActivityCte("$1", "$2")}
        SELECT record_id,
-              bool_or(file_path IS NULL) AS created_today,
-              COALESCE(array_agg(file_path ORDER BY sort_order) FILTER (WHERE file_path IS NOT NULL), '{}') AS photos_today,
+              bool_or(kind = 'record') AS created_today,
+              COALESCE(array_agg(file_path ORDER BY sort_order) FILTER (WHERE kind = 'photo'), '{}') AS photos_today,
               MAX(activity_at) AS last_activity_at
          FROM today_activity
+        WHERE kind <> 'report'
         GROUP BY record_id
         ORDER BY last_activity_at DESC, record_id DESC`,
       [req.user.id, req.params.id],
+    );
+
+    const { rows: reportPhotos } = await pool.query(
+      `WITH ${objectPhotoSourceCte({ objectParam: "$1", uploadedToday: true, sources: ["report"] })}
+       SELECT s.source_id AS id, s.file_path, s.comment, s.user_id, u.full_name AS author_name,
+              s.photo_date, s.uploaded_at AS created_at
+         FROM object_photo_source s LEFT JOIN users u ON u.id = s.user_id
+        ORDER BY s.uploaded_at DESC, s.source_id DESC`,
+      [req.params.id],
     );
 
     // Полная карточка — той же функцией, что GET /api/records/:id.
@@ -514,6 +570,7 @@ objectsRouter.get(
           photos_today: a.photos_today,
           last_activity_at: a.last_activity_at,
         })),
+      report_photos: reportPhotos,
     });
   }),
 );

@@ -1,13 +1,11 @@
 import { Router } from "express";
 import path from "node:path";
-import crypto from "node:crypto";
-import multer from "multer";
-import sharp from "sharp";
 import { pool } from "../db.js";
 import { requireAuth } from "../auth.js";
 import { insertAuditLog } from "../audit.js";
 import { asyncHandler } from "../async-handler.js";
-import { putPhoto, getPresignedUrl, deleteObject, objectExists, copyObject, listByPrefix, deleteByPrefix } from "../s3.js";
+import { deleteObject, objectExists, copyObject, listByPrefix, deleteByPrefix } from "../s3.js";
+import { photoUpload, photoUploadErrorHandler, savePhotoFile, redirectToPhoto } from "../photo-storage.js";
 
 // Корзина для фото удалённых записей: при удалении записи её объекты в S3 не
 // стираются сразу, а копируются сюда (префикс "trash/<trashName>/") — это
@@ -53,39 +51,10 @@ export async function photoFileExists(relativePath) {
 }
 
 const PHOTO_MAX_PER_RECORD = 30;
-const PHOTO_MAX_DIMENSION = 1920;
-const ALLOWED_EXT = new Set([".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"]);
-// ВАЖНО: должно совпадать с PHOTO_MAX_RAW_SIZE_BYTES на фронтенде
-// (pixel-perfect-view-518/src/components/app/record-form.tsx). Раньше тут
-// стояло 15 МБ, а на фронтенде клиентская проверка пропускала файлы до 30 МБ —
-// несжимаемые HEIC/JPEG с современных телефонов (48 Мп камера, панорамы)
-// проходили клиентскую проверку, но падали здесь с невнятной 500-й ошибкой,
-// а заодно из-за multer.array() валили ВЕСЬ пакет фото в этом запросе, включая
-// остальные нормальные снимки — отсюда жалобы "не все фото загрузились".
-const PHOTO_MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024;
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: PHOTO_MAX_FILE_SIZE_BYTES, files: PHOTO_MAX_PER_RECORD },
-});
-
-// Превращает ошибки multer (файл/пакет превышают лимит, слишком много файлов
-// и т.п.) в понятный ответ вместо общего "internal server error" из
-// глобального обработчика в app.js — раньше пользователь не мог понять,
-// что именно пошло не так, и повторная попытка с тем же файлом заведомо
-// повторяла ту же ошибку.
-function handlePhotoUploadErrors(err, _req, res, next) {
-  if (!err) return next();
-  if (err.code === "LIMIT_FILE_SIZE") {
-    const mb = Math.round(PHOTO_MAX_FILE_SIZE_BYTES / (1024 * 1024));
-    return res.status(413).json({ error: `файл превышает максимальный размер ${mb} МБ` });
-  }
-  if (err.code === "LIMIT_FILE_COUNT" || err.code === "LIMIT_UNEXPECTED_FILE") {
-    return res.status(400).json({ error: `максимум ${PHOTO_MAX_PER_RECORD} фото за раз` });
-  }
-  console.error("Ошибка загрузки фото:", err);
-  return res.status(500).json({ error: "не удалось загрузить фото" });
-}
+// Лимиты размера/расширения, sharp-пайплайн и разбор ошибок multer — в
+// photo-storage.js (общие с фото-отчётами по объекту).
+const upload = photoUpload(PHOTO_MAX_PER_RECORD);
+const handlePhotoUploadErrors = photoUploadErrorHandler(PHOTO_MAX_PER_RECORD);
 
 export const recordsRouter = Router();
 
@@ -428,7 +397,7 @@ recordsRouter.delete(
 recordsRouter.post(
   "/:id/photos",
   requireAuth,
-  upload.array("photos", PHOTO_MAX_PER_RECORD),
+  upload,
   handlePhotoUploadErrors,
   asyncHandler(async (req, res) => {
     const existing = await loadFullRecord(req.params.id);
@@ -447,45 +416,10 @@ recordsRouter.post(
     // пользователь не понимал, почему именно этого фото нет в записи
     // ("не все фото присутствуют")
     for (const file of files) {
-      const ext = path.extname(file.originalname).toLowerCase();
-      if (!ALLOWED_EXT.has(ext)) {
+      const fname = await savePhotoFile(req.params.id, file);
+      if (!fname) {
         skipped.push(file.originalname);
         continue;
-      }
-      const fname = `${crypto.randomUUID().replace(/-/g, "")}.jpg`;
-      let resized = false;
-      try {
-        const buffer = await sharp(file.buffer)
-          .rotate() // авто-поворот по EXIF
-          .resize({ width: PHOTO_MAX_DIMENSION, height: PHOTO_MAX_DIMENSION, fit: "inside", withoutEnlargement: true })
-          .jpeg({ quality: 82 })
-          .toBuffer();
-        await putPhoto(`${req.params.id}/${fname}`, buffer, "image/jpeg");
-        resized = true;
-      } catch {
-        try {
-          // если sharp не смог разобрать формат — сохраняем как есть, с исходным content-type
-          await putPhoto(`${req.params.id}/${fname}`, file.buffer, file.mimetype || "application/octet-stream");
-        } catch (writeErr) {
-          console.error(`Не удалось сохранить фото ${fname} записи ${req.params.id}:`, writeErr);
-          skipped.push(file.originalname);
-          continue; // пропускаем это фото, но не роняем весь запрос/процесс
-        }
-      }
-      // Превью генерируем только когда основной sharp-пайплайн отработал —
-      // в fallback-ветке (сохранение as-is) исходник может быть в формате,
-      // который sharp не разобрал, так что превью для него всё равно не выйдет.
-      if (resized) {
-        try {
-          const thumbBuffer = await sharp(file.buffer)
-            .rotate()
-            .resize({ width: 400, height: 400, fit: "inside", withoutEnlargement: true })
-            .jpeg({ quality: 68 })
-            .toBuffer();
-          await putPhoto(`${req.params.id}/thumb_${fname}`, thumbBuffer, "image/jpeg");
-        } catch (thumbErr) {
-          console.error(`Не удалось сгенерировать превью для фото ${fname} записи ${req.params.id}:`, thumbErr);
-        }
       }
       saved.push(fname);
       await pool.query(
@@ -507,22 +441,7 @@ recordsRouter.get(
     const record = await loadFullRecord(req.params.id);
     if (!record || !canView(record, req.user)) return res.status(404).json({ error: "not found" });
 
-    const safeName = path.basename(req.params.filename);
-    const relativePath = `${req.params.id}/${safeName}`;
-
-    if (req.query.thumb === "1") {
-      const thumbPath = `${req.params.id}/thumb_${safeName}`;
-      if (await objectExists(thumbPath)) {
-        const thumbUrl = await getPresignedUrl(thumbPath);
-        return res.redirect(302, thumbUrl);
-      }
-    }
-
-    if (!(await objectExists(relativePath))) {
-      return res.status(404).json({ error: "not found" });
-    }
-    const url = await getPresignedUrl(relativePath);
-    res.redirect(302, url);
+    await redirectToPhoto(res, req.params.id, req.params.filename, req.query.thumb === "1");
   }),
 );
 
