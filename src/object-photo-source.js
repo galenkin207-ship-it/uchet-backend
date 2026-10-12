@@ -45,6 +45,19 @@ export function recordFilterSql({ userParam, objectParam, doneOnly = false }) {
 //   sources          — какие ветки включать;
 //   userParam/doneOnly — правило видимости записей, см. recordFilterSql.
 // Параметры — готовые плейсхолдеры ("$1"...), нумерацию ведёт вызывающий код.
+// Контракт единого источника — порядок колонок во всех ветках UNION ALL.
+export const OBJECT_PHOTO_SOURCE_COLUMNS = [
+  "source", // text: 'record' | 'report'
+  "source_id", // int: records.id | object_photos.id
+  "object_id", // int
+  "file_path", // text, без S3_PREFIX
+  "photo_date", // date: records.date | object_photos.photo_date
+  "uploaded_at", // timestamptz
+  "user_id", // int: автор
+  "comment", // text
+  "sort_order", // int: порядок фото внутри записи, у фото-отчётов 0
+];
+
 export function objectPhotoSourceCte({
   userParam,
   objectParam,
@@ -60,9 +73,10 @@ export function objectPhotoSourceCte({
     const where = [recordFilterSql({ userParam, objectParam, doneOnly })];
     if (fromParam) where.push(`r.date >= ${fromParam}::date`);
     if (toParam) where.push(`r.date <= ${toParam}::date`);
-    const select = `SELECT 'record'::text AS source, r.id AS source_id, r.object_id, p.file_path,
-               r.date AS photo_date, COALESCE(p.created_at, r.created_at::timestamptz) AS uploaded_at,
-               r.created_by_user_id AS user_id, r.comment, p.sort_order
+    const select = `SELECT 'record'::text AS source, r.id::int AS source_id, r.object_id::int AS object_id,
+               p.file_path::text AS file_path, r.date::date AS photo_date,
+               COALESCE(p.created_at::timestamptz, r.created_at::timestamptz) AS uploaded_at,
+               r.created_by_user_id::int AS user_id, r.comment::text AS comment, p.sort_order::int AS sort_order
           FROM record_photos p JOIN records r ON r.id = p.record_id`;
     if (uploadedToday) {
       // Две ветки вместо COALESCE в WHERE — так каждая идёт по своему индексу.
@@ -84,13 +98,20 @@ export function objectPhotoSourceCte({
     if (fromParam) where.push(`op.photo_date >= ${fromParam}::date`);
     if (toParam) where.push(`op.photo_date <= ${toParam}::date`);
     if (uploadedToday) where.push(`op.created_at >= ${TODAY_START} AND op.created_at < ${TODAY_END}`);
-    branches.push(`SELECT 'report'::text, op.id, op.object_id, op.file_path, op.photo_date, op.created_at,
-               op.user_id, op.comment, 0
+    branches.push(`SELECT 'report'::text AS source, op.id::int AS source_id, op.object_id::int AS object_id,
+               op.file_path::text AS file_path, op.photo_date::date AS photo_date,
+               op.created_at::timestamptz AS uploaded_at,
+               op.user_id::int AS user_id, op.comment::text AS comment, 0::int AS sort_order
           FROM ${ACTIVE_OBJECT_PHOTOS} op
          WHERE ${where.join(" AND ")}`);
   }
 
-  return `object_photo_source AS (
+  // Имена колонок задаются списком у самого CTE, а не первой веткой UNION ALL:
+  // при sources:["report"] первой оказывалась ветка фото-отчётов, и CTE
+  // отдавал колонки с другими именами (s.source_id does not exist). Типы
+  // в ветках приведены явно, чтобы UNION ALL совпадал при любом наборе веток.
+  if (!branches.length) throw new Error("objectPhotoSourceCte: no sources");
+  return `object_photo_source (${OBJECT_PHOTO_SOURCE_COLUMNS.join(", ")}) AS (
       ${branches.join("\n      UNION ALL\n      ")}
     )`;
 }
