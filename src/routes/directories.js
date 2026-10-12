@@ -410,6 +410,114 @@ objectsRouter.get(
   }),
 );
 
+// ---- Активность объектов за сегодня (только admin) ----
+//
+// «Сегодня» — текущие сутки по Москве, а не по таймзоне сервера/сессии БД.
+// Границы — выражения от now() (stable), поэтому планировщик использует
+// индексы по created_at (см. миграцию 032). Сравнение timestamptz-границ
+// корректно и если records.created_at — timestamp без зоны (он приводится
+// по TimeZone сессии, в которой и был записан через DEFAULT now()).
+const MSK_DAY = "date_trunc('day', now() AT TIME ZONE 'Europe/Moscow')";
+const TODAY_START = `(${MSK_DAY} AT TIME ZONE 'Europe/Moscow')`;
+const TODAY_END = `((${MSK_DAY} + interval '1 day') AT TIME ZONE 'Europe/Moscow')`;
+
+// CTE today_activity — по строке на каждое «событие» сегодняшнего дня:
+// создание записи (file_path IS NULL) или загрузка фото. Время загрузки фото —
+// record_photos.created_at (миграция 032); у фото, загруженных до миграции,
+// его нет, и для них берётся created_at самой записи. Поле «дата работ»
+// (records.date) не учитывается вовсе. Черновики видны только автору — как в
+// GET /api/records, иначе админ увидел бы запись, карточку и фото которой
+// существующие эндпоинты ему не отдадут (canView в records.js).
+// Записи без object_id (старые, только object_name_raw) в объектную
+// активность не попадают — так же, как в work-summary/photos выше.
+function todayActivityCte(userParam, objectParam) {
+  const recordFilter = [
+    "r.object_id IS NOT NULL",
+    `(r.status <> 'draft' OR r.created_by_user_id = ${userParam})`,
+    ...(objectParam ? [`r.object_id = ${objectParam}`] : []),
+  ].join(" AND ");
+  return `today_activity AS (
+      SELECT r.id AS record_id, r.object_id, r.created_at::timestamptz AS activity_at,
+             NULL::text AS file_path, NULL::int AS sort_order
+        FROM records r
+       WHERE ${recordFilter} AND r.created_at >= ${TODAY_START} AND r.created_at < ${TODAY_END}
+      UNION ALL
+      SELECT r.id, r.object_id, p.created_at, p.file_path, p.sort_order
+        FROM record_photos p JOIN records r ON r.id = p.record_id
+       WHERE ${recordFilter} AND p.created_at >= ${TODAY_START} AND p.created_at < ${TODAY_END}
+      UNION ALL
+      SELECT r.id, r.object_id, r.created_at::timestamptz, p.file_path, p.sort_order
+        FROM record_photos p JOIN records r ON r.id = p.record_id
+       WHERE ${recordFilter} AND p.created_at IS NULL
+         AND r.created_at >= ${TODAY_START} AND r.created_at < ${TODAY_END}
+    )`;
+}
+
+// Сегодняшняя дата по Москве в виде YYYY-MM-DD — только для ответа клиенту.
+function moscowToday() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Moscow" }).format(new Date());
+}
+
+objectsRouter.get(
+  "/today-activity",
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const { rows } = await pool.query(
+      `WITH ${todayActivityCte("$1", null)}
+       SELECT o.id, o.name, o.address, o.status,
+              COUNT(*) FILTER (WHERE a.file_path IS NULL)::int AS records_count_today,
+              COUNT(*) FILTER (WHERE a.file_path IS NOT NULL)::int AS photos_count_today,
+              MAX(a.activity_at) AS last_activity_at
+         FROM today_activity a JOIN objects o ON o.id = a.object_id
+        GROUP BY o.id
+        ORDER BY last_activity_at DESC, o.id`,
+      [req.user.id],
+    );
+    res.json({ date: moscowToday(), objects: rows });
+  }),
+);
+
+objectsRouter.get(
+  "/:id/today",
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: "not found" });
+    const { rows: objectRows } = await pool.query(
+      `SELECT id, name, address, status FROM objects WHERE id = $1`,
+      [req.params.id],
+    );
+    if (!objectRows[0]) return res.status(404).json({ error: "not found" });
+
+    const { rows: activity } = await pool.query(
+      `WITH ${todayActivityCte("$1", "$2")}
+       SELECT record_id,
+              bool_or(file_path IS NULL) AS created_today,
+              COALESCE(array_agg(file_path ORDER BY sort_order) FILTER (WHERE file_path IS NOT NULL), '{}') AS photos_today,
+              MAX(activity_at) AS last_activity_at
+         FROM today_activity
+        GROUP BY record_id
+        ORDER BY last_activity_at DESC, record_id DESC`,
+      [req.user.id, req.params.id],
+    );
+
+    // Полная карточка — той же функцией, что GET /api/records/:id.
+    const records = await loadRecordsByIds(activity.map((a) => a.record_id));
+    const byId = new Map(records.map((r) => [r.id, r]));
+    res.json({
+      date: moscowToday(),
+      object: objectRows[0],
+      records: activity
+        .filter((a) => byId.has(a.record_id))
+        .map((a) => ({
+          ...byId.get(a.record_id),
+          created_today: a.created_today,
+          photos_today: a.photos_today,
+          last_activity_at: a.last_activity_at,
+        })),
+    });
+  }),
+);
+
 // Сотрудники всегда показываются в алфавитном порядке по ФИО (а не по
 // порядку добавления, как остальные справочники по умолчанию) — так проще
 // находить нужного человека в длинном списке, и новые сотрудники сразу
