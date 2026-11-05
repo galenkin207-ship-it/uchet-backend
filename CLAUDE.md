@@ -8,7 +8,7 @@
 
 Node.js/Express + PostgreSQL 16. Бэкенд «Учёт работ».
 
-- Прод: код на сервере `ifrwcmgytz` (85.198.98.136) в `/opt/uchet/server`
+- Прод: код на сервере `cv8273421` (194.58.118.232, uchet.rsuhub.ru) в `/opt/uchet/server`
   — это НЕ git checkout, а авто-обновляемая директория (процесс `deploy`,
   обновляется в течение секунд после push в `main`)
 - Staging: `/opt/uchet-staging/` на том же сервере, отдельная БД `uchet_db_staging`,
