@@ -35,8 +35,8 @@ export const workTypesTreeRouter = Router();
 
 // /search-smart: если лучший similarity ступени A ниже порога — включается
 // ступень B (реранк топ-кандидатов через DeepSeek).
-const SEARCH_SMART_RERANK_THRESHOLD = 0.8;
-const SEARCH_SMART_RERANK_CANDIDATES = 20;
+const SEARCH_SMART_RERANK_THRESHOLD = Number(process.env.SEARCH_SMART_RERANK_THRESHOLD) || 0.8;
+const SEARCH_SMART_RERANK_CANDIDATES = Math.min(Number(process.env.SEARCH_SMART_RERANK_CANDIDATES) || 20, 50);
 // Гибридные кандидаты для ступени B: сверх топа pgvector добавляем до стольких
 // позиций, найденных текстовым совпадением по специфическим словам запроса.
 const SEARCH_SMART_KEYWORD_CANDIDATES = 10;
