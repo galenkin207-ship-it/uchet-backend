@@ -1,26 +1,27 @@
 import "dotenv/config";
 import { pool } from "../src/db.js";
-// Тот же клиент, что у сервиса: при заданном AI_PROXY запросы к OpenAI идут
-// через прокси (src/openai.js). .env читается из текущей директории — запускать
-// из корня бэкенда, как и сервис.
-import { createEmbeddings } from "../src/openai.js";
-import { errorName, attemptStatus } from "../src/ai-fetch.js";
+import { getEmbeddings } from "../src/embeddings.js";
+
+// Пересчёт эмбеддингов листьев справочника через локальную службу uchet-embed (bge-m3).
+// Берёт только позиции без эмбеддинга. .env читается из текущей директории,
+// запускать из корня бэкенда, как и сервис.
+// По умолчанию пробный запуск (без записи); запись только с флагом --apply.
 
 const APPLY = process.argv.includes("--apply");
-const BATCH_SIZE = 100;
+const BATCH_SIZE = 16; // максимум службы за один запрос
 
 function buildText(row) {
   const parts = [row.name, row.variant_label, row.work_composition].filter(Boolean);
   return parts.join(". ");
 }
 
-async function main() {
-  if (!process.env.OPENAI_API_KEY) {
-    console.error("OPENAI_API_KEY не задан в .env");
-    process.exit(1);
-  }
+// Только статус или имя ошибки: текст ошибок может содержать лишнее
+function reason(err) {
+  return err?.status ?? err?.cause?.code ?? err?.name ?? "error";
+}
 
-  console.log(`Режим: ${APPLY ? "APPLY (реальная запись + траты токенов)" : "DRY-RUN (без API-вызовов, без записи)"}`);
+async function main() {
+  console.log(`Режим: ${APPLY ? "APPLY (реальная запись)" : "DRY-RUN (без вызовов службы, без записи)"}`);
 
   const { rows } = await pool.query(
     `SELECT id, name, variant_label, work_composition
@@ -42,7 +43,7 @@ async function main() {
   if (!APPLY) {
     console.log("---");
     console.log(`Батчей по ${BATCH_SIZE} штук: ${Math.ceil(rows.length / BATCH_SIZE)}`);
-    console.log("Это dry-run — API не вызывался, ничего не потрачено и не записано.");
+    console.log("Это dry-run: служба не вызывалась, ничего не записано.");
     await pool.end();
     return;
   }
@@ -52,24 +53,19 @@ async function main() {
 
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const batch = rows.slice(i, i + BATCH_SIZE);
-    const texts = batch.map(buildText);
-
     try {
-      const response = await createEmbeddings(texts);
-
+      const vectors = await getEmbeddings(batch.map(buildText));
       for (let j = 0; j < batch.length; j++) {
-        const vector = response.data[j].embedding;
-        await pool.query(
-          `UPDATE work_types SET embedding = $1 WHERE id = $2`,
-          [JSON.stringify(vector), batch[j].id]
-        );
+        await pool.query(`UPDATE work_types SET embedding = $1 WHERE id = $2`, [
+          JSON.stringify(vectors[j]),
+          batch[j].id,
+        ]);
       }
-
       processed += batch.length;
       console.log(`Обработано: ${processed}/${rows.length}`);
     } catch (err) {
       failed += batch.length;
-      console.error(`Ошибка на батче ${i}-${i + batch.length}: ${errorName(err)} ${attemptStatus(err)}`);
+      console.error(`Ошибка на батче ${i}-${i + batch.length}: ${reason(err)}`);
     }
   }
 
@@ -80,4 +76,7 @@ async function main() {
   await pool.end();
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

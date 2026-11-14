@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { pool } from "../db.js";
-import { getQueryEmbedding } from "../openai.js";
+import { getQueryEmbedding } from "../embeddings.js";
 import { rerankCandidates, CONFIDENCE_LEVELS } from "../deepseek.js";
 import { requireAuth, requireRole, isAdminLike } from "../auth.js";
 import { asyncHandler } from "../async-handler.js";
