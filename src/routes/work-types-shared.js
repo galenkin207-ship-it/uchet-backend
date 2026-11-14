@@ -424,7 +424,7 @@ async function refreshEmbeddings(ids) {
   if (!rows.length) return;
   // Ленивый импорт: этот модуль импортируют и офлайн-скрипты
   // (scripts/test-build-leaf-name.js) — им openai/undici не нужны.
-  const { getEmbedding } = await import("../openai.js");
+  const { getEmbedding } = await import("../embeddings.js");
   for (const row of rows) {
     try {
       const vector = await getEmbedding(buildEmbeddingText(row));

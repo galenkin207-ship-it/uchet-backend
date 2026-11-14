@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { pool } from "../db.js";
-import { getQueryEmbedding } from "../openai.js";
+import { getQueryEmbedding } from "../embeddings.js";
 import { rerankCandidates, CONFIDENCE_LEVELS } from "../deepseek.js";
 import { requireAuth, requireRole, isAdminLike } from "../auth.js";
 import { asyncHandler } from "../async-handler.js";
@@ -35,8 +35,8 @@ export const workTypesTreeRouter = Router();
 
 // /search-smart: если лучший similarity ступени A ниже порога — включается
 // ступень B (реранк топ-кандидатов через DeepSeek).
-const SEARCH_SMART_RERANK_THRESHOLD = 0.8;
-const SEARCH_SMART_RERANK_CANDIDATES = 20;
+const SEARCH_SMART_RERANK_THRESHOLD = Number(process.env.SEARCH_SMART_RERANK_THRESHOLD) || 0.8;
+const SEARCH_SMART_RERANK_CANDIDATES = Math.min(Number(process.env.SEARCH_SMART_RERANK_CANDIDATES) || 20, 50);
 // Гибридные кандидаты для ступени B: сверх топа pgvector добавляем до стольких
 // позиций, найденных текстовым совпадением по специфическим словам запроса.
 const SEARCH_SMART_KEYWORD_CANDIDATES = 10;
